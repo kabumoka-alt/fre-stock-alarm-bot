@@ -6,13 +6,6 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-# 🔥 미국 대형 + 인기주 (TOP100 대신 안정 버전)
-SYMBOLS = [
-    "AAPL","TSLA","NVDA","AMD","META","MSFT","AMZN","GOOGL","SPY","QQQ",
-    "PLTR","NFLX","INTC","SOFI","BABA","ORCL","DIS","UBER","LYFT","SNOW",
-    "COIN","MSTR","RIOT","MARA","SHOP","SQ","PYPL","AMD","TSM","BA"
-]
-
 def send(msg):
     try:
         requests.get(
@@ -22,35 +15,61 @@ def send(msg):
     except:
         pass
 
-def get_price(symbol):
+# 📌 전체 US 종목 리스트 가져오기
+def get_all_symbols():
+    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
+    r = requests.get(url).json()
+
+    if not isinstance(r, list):
+        return []
+
+    return [x["symbol"] for x in r if x.get("symbol")][:300]  # 안정용 제한
+
+# 📌 상승률 계산
+def get_change(symbol):
     try:
         url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-        r = requests.get(url).json()
-        return r
-    except:
-        return {}
+        r = requests.get(url, timeout=5).json()
 
-print("BOT STARTED")
+        c = r.get("c")
+        pc = r.get("pc")
+
+        if not c or not pc or pc == 0:
+            return None
+
+        return ((c - pc) / pc) * 100
+
+    except:
+        return None
+
+print("🚀 TOP100 SCANNER STARTED")
 
 while True:
     try:
-        for s in SYMBOLS:
+        symbols = get_all_symbols()
 
-            data = get_price(s)
+        results = []
 
-            current = data.get("c")
-            prev = data.get("pc")
+        # 📊 전체 상승률 계산
+        for s in symbols:
+            ch = get_change(s)
 
-            if not current or not prev or prev == 0:
+            if ch is None:
                 continue
 
-            change = ((current - prev) / prev) * 100
+            results.append((s, ch))
 
-            print(s, change)
+        # 🔥 상승률 정렬 → TOP100
+        top100 = sorted(results, key=lambda x: x[1], reverse=True)[:100]
 
-            # 🚀 실전 기준 (급등 알림)
-            if change >= 5:
-                send(f"🚀 급등 감지\n{s}\n+{change:.2f}%")
+        print("TOP CALCULATED")
+
+        # 🚨 상위 5개만 알림 (스팸 방지)
+        for s, ch in top100[:5]:
+            print(s, ch)
+
+            if ch >= 3:
+                send(f"🚀 TOP100 급등\n{s}\n+{ch:.2f}%")
 
         time.sleep(60)
 
