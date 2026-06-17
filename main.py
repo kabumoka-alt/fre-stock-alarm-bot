@@ -1,19 +1,27 @@
 import os
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
 def is_market_open():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     hour = now.hour
+    minute = now.minute
 
-    # 🇺🇸 단순 필터 (정확한 버전)
-    # 정규장: UTC 14:30 ~ 21:00 (대략)
-    return 14 <= hour <= 21
+    # 🇺🇸 미국 정규장 (UTC 기준 안정 버전)
+    # 13:30 ~ 20:00 UTC
+    if hour < 13 or hour > 20:
+        return False
+    if hour == 13 and minute < 30:
+        return False
+    if hour == 20 and minute > 0:
+        return False
+
+    return True
 
 def send(msg):
     try:
@@ -27,8 +35,10 @@ def send(msg):
 def get_symbols():
     url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
     r = requests.get(url).json()
+
     if not isinstance(r, list):
         return []
+
     return [x["symbol"] for x in r[:300]]
 
 def get_change(symbol):
@@ -47,11 +57,11 @@ def get_change(symbol):
     except:
         return None
 
-print("🚀 TOP100 SCANNER STARTED (MARKET FILTER ON)")
+print("🚀 TOP100 SCANNER STARTED (FIXED MARKET TIME)")
 
 while True:
     try:
-        # 🚨 정규장 아닐 때 스킵
+        # ⛔ 시장 닫힘이면 대기
         if not is_market_open():
             print("⛔ MARKET CLOSED")
             time.sleep(300)
@@ -66,13 +76,17 @@ while True:
                 continue
             results.append((s, ch))
 
+        # 📊 상승률 TOP100
         top100 = sorted(results, key=lambda x: x[1], reverse=True)[:100]
 
+        print("TOP100 READY")
+
+        # 🚨 상위 알림
         for s, ch in top100[:5]:
             print(s, ch)
 
             if ch >= 3:
-                send(f"🚀 정규장 TOP100\n{s}\n+{ch:.2f}%")
+                send(f"🚀 TOP100 급등\n{s}\n+{ch:.2f}%")
 
         time.sleep(60)
 
