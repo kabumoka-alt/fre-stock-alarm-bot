@@ -1,25 +1,24 @@
+import os
 import requests
 import time
 from datetime import datetime
-import pytz
-import pandas as pd
 
 # ======================
-# 🔥 설정값
+# 🔥 설정
 # ======================
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD"]  # 감시 종목
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN"]
 
-RSI_PERIOD = 14
-SCAN_INTERVAL = 60  # 60초마다 체크
+SCAN_INTERVAL = 60
 
 # ======================
-# 📩 텔레그램 전송
+# 📩 텔레그램
 # ======================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": msg}
     try:
         requests.post(url, data=data, timeout=10)
@@ -27,52 +26,35 @@ def send_telegram(msg):
         print("Telegram error:", e)
 
 # ======================
-# 🕒 미국장 시간 체크 (핵심 수정본)
+# 🕒 MARKET CHECK (단순 UTC)
 # ======================
 def is_market_open():
-    ny = pytz.timezone("America/New_York")
-    now = datetime.now(ny)
+    now = datetime.utcnow()
 
-    # 평일 체크 (월~금)
     if now.weekday() >= 5:
         return False
 
-    # 09:30 ~ 16:00 (미국 정규장)
-    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    # 미국장 대략 시간
+    if 13 <= now.hour < 20:
+        return True
 
-    return open_time <= now <= close_time
-
-# ======================
-# 📊 RSI 계산
-# ======================
-def calc_rsi(prices, period=14):
-    df = pd.DataFrame(prices, columns=["close"])
-    delta = df["close"].diff()
-
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    return False
 
 # ======================
-# 📡 가격 가져오기 (예시: Finnhub)
+# 📡 가격 가져오기
 # ======================
-def get_prices(symbol):
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token=YOUR_API_KEY"
+def get_price(symbol):
+    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
     r = requests.get(url).json()
-
-    # 간단히 close 기준 mock (실전은 candle API 추천)
-    return [r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"],
-            r["c"], r["c"], r["c"], r["c"], r["c"]]
+    return r["c"]
 
 # ======================
-# 🚀 메인 스캐너
+# 🚀 MAIN
 # ======================
 def run():
-    send_telegram("🚀 10MIN PUMP MODEL STARTED")
+    send_telegram("🚀 30% PUMP SCANNER STARTED")
+
+    base_price = {}  # 기준 가격 저장
 
     while True:
         try:
@@ -84,15 +66,28 @@ def run():
             print("📊 SCANNING...")
 
             for symbol in SYMBOLS:
-                prices = get_prices(symbol)
-                rsi = calc_rsi(prices)
+                price = get_price(symbol)
 
-                print(symbol, "RSI:", rsi)
+                # 🔥 기준값 없으면 세팅
+                if symbol not in base_price:
+                    base_price[symbol] = price
 
-                # 🚨 조건 (원하면 수정 가능)
-                if 50 <= rsi <= 70:
-                    msg = f"🚀 {symbol} SIGNAL\nRSI: {rsi:.2f}"
-                    send_telegram(msg)
+                change = (price - base_price[symbol]) / base_price[symbol] * 100
+
+                print(symbol, price, f"{change:.2f}%")
+
+                # 🚨 30% 급등 알림
+                if change >= 30:
+                    send_telegram(
+                        f"🚀🚀 {symbol} +{change:.2f}% PUMP ALERT!"
+                    )
+
+                    # 🔁 기준값 업데이트 (중복 알림 방지)
+                    base_price[symbol] = price
+
+                # 🔻 급락하면 기준도 갱신 (리셋 방지)
+                if change <= -10:
+                    base_price[symbol] = price
 
             time.sleep(SCAN_INTERVAL)
 
