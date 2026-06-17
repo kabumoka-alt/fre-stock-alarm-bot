@@ -1,102 +1,179 @@
 import os
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-# ======================
-# 🔥 설정
-# ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN"]
-
-SCAN_INTERVAL = 60
-
-# ======================
-# 📩 텔레그램
-# ======================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg}
-    try:
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        print("Telegram error:", e)
-
-# ======================
-# 🕒 MARKET CHECK (단순 UTC)
-# ======================
+# -----------------------------
+# ⛔ 미국장 시간 체크 (UTC)
+# -----------------------------
 def is_market_open():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    minute = now.minute
 
-    if now.weekday() >= 5:
+    if hour < 13 or hour > 20:
+        return False
+    if hour == 13 and minute < 30:
+        return False
+    if hour == 20 and minute > 0:
         return False
 
-    # 미국장 대략 시간
-    if 13 <= now.hour < 20:
-        return True
+    return True
 
-    return False
 
-# ======================
-# 📡 가격 가져오기
-# ======================
-def get_price(symbol):
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+# -----------------------------
+# 📩 텔레그램 알림
+# -----------------------------
+def send(msg):
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            params={"chat_id": CHAT_ID, "text": msg}
+        )
+    except:
+        pass
+
+
+# -----------------------------
+# 📊 종목 리스트
+# -----------------------------
+def get_symbols():
+    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
     r = requests.get(url).json()
-    return r["c"]
 
-# ======================
-# 🚀 MAIN
-# ======================
-def run():
-    send_telegram("🚀 30% PUMP SCANNER STARTED")
+    if not isinstance(r, list):
+        return []
 
-    base_price = {}  # 기준 가격 저장
+    return [x["symbol"] for x in r[:200]]  # 속도 위해 200개 제한
 
-    while True:
-        try:
-            if not is_market_open():
-                print("⛔ MARKET CLOSED")
-                time.sleep(30)
+
+# -----------------------------
+# 📈 가격 + 등락률
+# -----------------------------
+def get_price_change(symbol):
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+        r = requests.get(url, timeout=5).json()
+
+        price = r.get("c")
+        prev = r.get("pc")
+
+        if not price or not prev or prev == 0:
+            return None
+
+        change = ((price - prev) / prev) * 100
+
+        return price, change
+
+    except:
+        return None
+
+
+# -----------------------------
+# 📊 거래량 (5분 캔들 기반)
+# -----------------------------
+def get_volume_ratio(symbol):
+    try:
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=5&count=20&token={FINNHUB_KEY}"
+        r = requests.get(url, timeout=5).json()
+
+        volumes = r.get("v", [])
+        if len(volumes) < 5:
+            return None
+
+        avg_vol = sum(volumes[:-1]) / len(volumes[:-1])
+        current_vol = volumes[-1]
+
+        if avg_vol == 0:
+            return 0
+
+        return current_vol / avg_vol
+
+    except:
+        return None
+
+
+# -----------------------------
+# 🎯 급등 직전 점수 시스템
+# -----------------------------
+def calc_score(change, volume_ratio):
+    score = 0
+
+    # 📈 초기 상승 구간
+    if 1 <= change <= 6:
+        score += 2
+
+    # 💣 거래량 폭발
+    if volume_ratio >= 3:
+        score += 3
+    elif volume_ratio >= 2:
+        score += 2
+
+    return score
+
+
+# -----------------------------
+# 🚀 실행 시작
+# -----------------------------
+print("🚀 TOP SCANNER STARTED (MOMENTUM MODE)")
+
+sent = set()
+
+while True:
+    try:
+        if not is_market_open():
+            print("⛔ MARKET CLOSED")
+            time.sleep(300)
+            continue
+
+        symbols = get_symbols()
+        results = []
+
+        for s in symbols:
+            price_data = get_price_change(s)
+            vol_ratio = get_volume_ratio(s)
+
+            if not price_data or vol_ratio is None:
                 continue
 
-            print("📊 SCANNING...")
+            price, change = price_data
 
-            for symbol in SYMBOLS:
-                price = get_price(symbol)
+            score = calc_score(change, vol_ratio)
 
-                # 🔥 기준값 없으면 세팅
-                if symbol not in base_price:
-                    base_price[symbol] = price
+            if score >= 4:
+                results.append((s, price, change, vol_ratio, score))
 
-                change = (price - base_price[symbol]) / base_price[symbol] * 100
+        # 🔥 점수 높은 순 정렬
+        results.sort(key=lambda x: x[4], reverse=True)
 
-                print(symbol, price, f"{change:.2f}%")
+        print(f"FOUND: {len(results)} candidates")
 
-                # 🚨 30% 급등 알림
-                if change >= 30:
-                    send_telegram(
-                        f"🚀🚀 {symbol} +{change:.2f}% PUMP ALERT!"
-                    )
+        # 🚨 상위 알림
+        for s, price, change, vol, score in results[:10]:
 
-                    # 🔁 기준값 업데이트 (중복 알림 방지)
-                    base_price[symbol] = price
+            if s in sent:
+                continue
 
-                # 🔻 급락하면 기준도 갱신 (리셋 방지)
-                if change <= -10:
-                    base_price[symbol] = price
+            msg = (
+                f"🚨 급등 직전 포착\n"
+                f"{s}\n"
+                f"현재가: ${price:.2f}\n"
+                f"등락: +{change:.2f}%\n"
+                f"거래량: {vol:.2f}x\n"
+                f"점수: {score}"
+            )
 
-            time.sleep(SCAN_INTERVAL)
+            print(msg)
+            send(msg)
 
-        except Exception as e:
-            print("ERROR:", e)
-            time.sleep(10)
+            sent.add(s)
 
-# ======================
-# ▶ 실행
-# ======================
-if __name__ == "__main__":
-    run()
+        time.sleep(60)
+
+    except Exception as e:
+        print("error:", e)
+        time.sleep(10)
