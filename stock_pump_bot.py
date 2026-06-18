@@ -173,12 +173,25 @@ def run_scan(session: str):
 
     ranked = []
     for sym, snap in snapshots.items():
+        latest_trade = snap.get("latestTrade", {})
+        minute_bar = snap.get("minuteBar", {})
         daily = snap.get("dailyBar", {})
         prev = snap.get("prevDailyBar", {})
-        if not daily or not prev or not prev.get("c"):
+
+        if not prev or not prev.get("c"):
             continue
-        change_pct = ((daily["c"] - prev["c"]) / prev["c"]) * 100
-        ranked.append({"symbol": sym, "price": daily["c"], "change_pct": change_pct})
+
+        # 현재가 우선순위: 실시간 체결가 > 1분봉 종가 > 일봉 종가
+        current_price = (
+            latest_trade.get("p") or
+            minute_bar.get("c") or
+            daily.get("c")
+        )
+        if not current_price:
+            continue
+
+        change_pct = ((current_price - prev["c"]) / prev["c"]) * 100
+        ranked.append({"symbol": sym, "price": current_price, "change_pct": change_pct})
 
     ranked = sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
     is_extended = session in ("pre", "after", "overnight")
