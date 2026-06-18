@@ -127,8 +127,36 @@ def calc_rsi(bars: list, period: int = 14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = False):
+def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = False, snap: dict = None):
     """종목 분석. extended=True면 프리/애프터 조건 추가"""
+
+    # overnight은 bars 없으므로 스냅샷 데이터로 5분 상승률만 체크
+    if is_overnight and snap:
+        minute_bar = snap.get("minuteBar", {})
+        prev_minute_bar = snap.get("prevMinuteBar", {})
+        daily_bar = snap.get("dailyBar", {})
+        latest_trade = snap.get("latestTrade", {})
+
+        current_price = latest_trade.get("p") or minute_bar.get("c") or daily_bar.get("c")
+        prev_price = prev_minute_bar.get("c") or minute_bar.get("o")
+
+        if not current_price or not prev_price or prev_price == 0:
+            print(f"    └ 주간거래 가격 데이터 없음")
+            return None
+
+        price_change_5m = ((current_price - prev_price) / prev_price) * 100
+        current_vol = minute_bar.get("v", 0)
+        avg_vol = daily_bar.get("v", 1)
+        vol_ratio = current_vol / (avg_vol / 390) if avg_vol > 0 else 0  # 하루 390분 기준
+
+        price_ok = "✅" if price_change_5m >= EXTENDED_PRICE_CHANGE else "❌"
+        print(f"  └ 주간: {price_change_5m:+.2f}%{price_ok} | 거래량:{vol_ratio:.1f}x")
+
+        if price_change_5m < EXTENDED_PRICE_CHANGE:
+            return None
+
+        return {"rsi": None, "price_change_5m": price_change_5m, "vol_ratio": vol_ratio}
+
     bars = get_bars(symbol, limit=30)
     if not bars or len(bars) < 6:
         print(f"    └ 데이터 부족: {len(bars) if bars else 0}개")
@@ -153,7 +181,6 @@ def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = Fal
 
         if price_change_5m < EXTENDED_PRICE_CHANGE:
             return None
-        # overnight은 거래량 조건 미적용
         if not is_overnight and vol_ratio < EXTENDED_VOLUME_MULT:
             return None
 
@@ -222,8 +249,9 @@ def run_scan(session: str):
             if elapsed < COOLDOWN_MINUTES:
                 continue
 
+        snap = snapshots.get(sym, {})
         print(f"  [{sym}] 분석 중...")
-        result = analyze_symbol(sym, extended=is_extended, is_overnight=(session == "overnight"))
+        result = analyze_symbol(sym, extended=is_extended, is_overnight=(session == "overnight"), snap=snap)
         if result is None:
             continue
 
@@ -238,7 +266,7 @@ def run_scan(session: str):
                 f"📉 전일종가: ${stock.get('prev_close', 0):.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
                 f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
-                f"📊 RSI: <b>{result['rsi']:.1f}</b>\n"
+                f"📊 RSI: <b>{result['rsi'] if result['rsi'] else 'N/A'}</b>\n"
                 f"📦 거래량: <b>{result['vol_ratio']:.1f}x</b>\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
             )
