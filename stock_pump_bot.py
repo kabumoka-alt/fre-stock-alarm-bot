@@ -101,8 +101,14 @@ def get_snapshots(symbols: list):
 
 def get_bars(symbol: str, limit: int = 30):
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {"timeframe": "1Min", "limit": limit, "feed": "iex", "sort": "asc"}
+    # 주간거래용: feed 없이 요청하면 가능한 최선의 데이터
+    params = {"timeframe": "1Min", "limit": limit, "sort": "asc"}
     try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("bars", [])
+        # 실패시 iex로 재시도
+        params["feed"] = "iex"
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if resp.status_code == 200:
             return resp.json().get("bars", [])
@@ -130,34 +136,35 @@ def calc_rsi(bars: list, period: int = 14):
 def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = False, snap: dict = None):
     """종목 분석. extended=True면 프리/애프터 조건 추가"""
 
-    # overnight은 bars 없으므로 스냅샷 데이터로 5분 상승률만 체크
-    if is_overnight and snap:
-        minute_bar = snap.get("minuteBar", {})
-        prev_minute_bar = snap.get("prevMinuteBar", {})
-        daily_bar = snap.get("dailyBar", {})
-        latest_trade = snap.get("latestTrade", {})
-
-        current_price = latest_trade.get("p") or minute_bar.get("c") or daily_bar.get("c")
-        prev_price = prev_minute_bar.get("c") or minute_bar.get("o")
-
-        if not current_price or not prev_price or prev_price == 0:
-            print(f"    └ 주간거래 가격 데이터 없음")
-            return None
-
-        price_change_5m = ((current_price - prev_price) / prev_price) * 100
-        current_vol = minute_bar.get("v", 0)
-        avg_vol = daily_bar.get("v", 1)
-        vol_ratio = current_vol / (avg_vol / 390) if avg_vol > 0 else 0  # 하루 390분 기준
-
-        price_ok = "✅" if price_change_5m >= EXTENDED_PRICE_CHANGE else "❌"
-        print(f"  └ 주간: {price_change_5m:+.2f}%{price_ok} | 거래량:{vol_ratio:.1f}x")
-
-        if price_change_5m < EXTENDED_PRICE_CHANGE:
-            return None
-
-        return {"rsi": None, "price_change_5m": price_change_5m, "vol_ratio": vol_ratio}
-
     bars = get_bars(symbol, limit=30)
+
+    # overnight: bars 없으면 스냅샷으로 폴백
+    if is_overnight and (not bars or len(bars) < 6):
+        if snap:
+            minute_bar = snap.get("minuteBar", {})
+            daily_bar = snap.get("dailyBar", {})
+            latest_trade = snap.get("latestTrade", {})
+
+            current_price = latest_trade.get("p") or minute_bar.get("c") or daily_bar.get("c")
+            prev_price = minute_bar.get("o")
+
+            if not current_price or not prev_price or prev_price == 0:
+                print(f"    └ 주간거래 가격 데이터 없음")
+                return None
+
+            price_change_5m = ((current_price - prev_price) / prev_price) * 100
+            current_vol = minute_bar.get("v", 0)
+            avg_vol = daily_bar.get("v", 1)
+            vol_ratio = current_vol / (avg_vol / 390) if avg_vol > 0 else 0
+
+            price_ok = "✅" if price_change_5m >= EXTENDED_PRICE_CHANGE else "❌"
+            print(f"  └ 주간(스냅샷): {price_change_5m:+.2f}%{price_ok} | 거래량:{vol_ratio:.1f}x")
+
+            if price_change_5m < EXTENDED_PRICE_CHANGE:
+                return None
+
+            return {"rsi": None, "price_change_5m": price_change_5m, "vol_ratio": vol_ratio}
+        return None
     if not bars or len(bars) < 6:
         print(f"    └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
