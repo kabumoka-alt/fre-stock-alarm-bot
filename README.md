@@ -1,1 +1,1 @@
-# stock-alarm-bot
+# am-stock-alram
