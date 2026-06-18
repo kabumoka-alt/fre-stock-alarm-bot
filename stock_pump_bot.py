@@ -138,21 +138,24 @@ def analyze_symbol(symbol: str, extended: bool = False):
         return None
 
     if extended:
-        # 5분 가격 변화
         current_price = float(bars[-1]["c"])
         price_5m_ago = float(bars[-6]["c"])
         price_change_5m = ((current_price - price_5m_ago) / price_5m_ago) * 100
 
-        # 거래량 배율
         current_vol = float(bars[-1]["v"])
         avg_vol = sum(float(b["v"]) for b in bars[:-1]) / len(bars[:-1])
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
+
+        price_ok = "✅" if price_change_5m >= EXTENDED_PRICE_CHANGE else "❌"
+        vol_ok = "✅" if vol_ratio >= EXTENDED_VOLUME_MULT else "❌"
+        print(f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok} | 거래량:{vol_ratio:.1f}x{vol_ok}")
 
         if price_change_5m < EXTENDED_PRICE_CHANGE or vol_ratio < EXTENDED_VOLUME_MULT:
             return None
 
         return {"rsi": rsi, "price_change_5m": price_change_5m, "vol_ratio": vol_ratio}
 
+    print(f"  └ RSI:{rsi:.1f}")
     return {"rsi": rsi}
 
 
