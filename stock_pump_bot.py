@@ -1,10 +1,11 @@
 """
-미국 주식 급등 감지 봇 v10
+미국 주식 급등 감지 봇 v10 + OBV
 - 주간거래: 일중 상승률 27%+ 알림
 - 프리/정규/애프터: 5분봉 5%+ & RSI 50+ (실시간 호가 기준)
 - 티커 클릭 시 네이버 증권 연결
-- [NEW] 매도 타이밍 알림: +7% 1차, +15% 전량, -4% 손절
-- [NEW] 매도 알림 후에도 모니터링 유지 (재급등 재진입 대응)
+- 매도 타이밍 알림: +7% 1차, +15% 전량, -4% 손절
+- 매도 알림 후에도 모니터링 유지 (재급등 재진입 대응)
+- [NEW] 정규장 알림에 OBV 방향 참고 표시
 """
 
 import os
@@ -47,10 +48,10 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
 }
 
-# 급등 포착 시점 진입가 기록: {symbol: {"entry": price, "time": datetime, "alert1": datetime|None, "alert2": datetime|None, "stop": datetime|None}}
+# 급등 포착 시점 진입가 기록
 entry_prices = {}
 
-# 급등 진입 알림 쿨다운: {symbol: datetime}
+# 급등 진입 알림 쿨다운
 last_alert = {}
 
 
@@ -155,6 +156,42 @@ def calc_rsi(bars: list, period: int = 14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
+def calc_obv(bars: list) -> str:
+    """
+    OBV 계산 + 방향 판단 (참고용, 필터 아님)
+    최근 5개 봉 기준으로 상승/하락/횡보 판단
+    """
+    if len(bars) < 3:
+        return "-"
+
+    obv = 0
+    obv_list = []
+    for i, bar in enumerate(bars):
+        if i == 0:
+            obv_list.append(obv)
+            continue
+        close = float(bar["c"])
+        prev_close = float(bars[i - 1]["c"])
+        vol = float(bar["v"])
+        if close > prev_close:
+            obv += vol
+        elif close < prev_close:
+            obv -= vol
+        obv_list.append(obv)
+
+    # 최근 5개 봉 추세
+    recent = obv_list[-5:]
+    rising = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
+    falling = len(recent) - 1 - rising
+
+    if rising >= 3:
+        return "📈상승"
+    elif falling >= 3:
+        return "📉하락"
+    else:
+        return "➡️횡보"
+
+
 def get_live_price(snap: dict):
     latest_trade = snap.get("latestTrade", {})
     minute_bar = snap.get("minuteBar", {})
@@ -190,11 +227,6 @@ def build_ranked(snapshots: dict):
 
 
 def check_sell_timing(sym: str, current_price: float, price_source: str, session_label: str):
-    """
-    진입가 대비 현재가로 매도 타이밍 체크.
-    매도 알림 후에도 모니터링 유지 (재급등 재진입 대응).
-    같은 레벨은 SELL_COOLDOWN_MINUTES 쿨다운으로 중복 방지.
-    """
     if sym not in entry_prices:
         return
 
@@ -285,13 +317,16 @@ def analyze_regular(sym: str, snap: dict):
     if rsi is None:
         return None
 
+    # OBV 계산 (참고용)
+    obv_label = calc_obv(bars)
+
     price_ok = "✅" if price_change_5m >= EXTENDED_PRICE_CHANGE else "❌"
-    print(f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok}")
+    print(f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok} | OBV:{obv_label}")
 
     if price_change_5m < EXTENDED_PRICE_CHANGE or rsi < REGULAR_RSI:
         return None
 
-    return {"rsi": rsi, "price_change_5m": price_change_5m}
+    return {"rsi": rsi, "price_change_5m": price_change_5m, "obv_label": obv_label}
 
 
 def analyze_extended(sym: str, snap: dict, check_volume: bool = True):
@@ -352,10 +387,9 @@ def run_scan(session: str):
         "overnight": "🌃 주간거래"
     }[session]
 
-    # ── 매도 타이밍 체크: 이미 진입가 기록된 종목들 ──
+    # 매도 타이밍 체크
     tracked_syms = list(entry_prices.keys())
     if tracked_syms:
-        # 스냅샷에 없는 종목은 별도 조회
         snap_map = {s["symbol"]: s for s in ranked}
         for sym in tracked_syms:
             if sym in snap_map:
@@ -377,8 +411,6 @@ def run_scan(session: str):
                     continue
 
             last_alert[sym] = now_utc
-
-            # 진입가 기록 (신규 또는 재진입)
             entry_prices[sym] = {
                 "entry": stock["price"],
                 "time": now_utc,
@@ -426,8 +458,6 @@ def run_scan(session: str):
                 continue
 
             last_alert[sym] = now_utc
-
-            # 진입가 기록 (신규 또는 재진입)
             entry_prices[sym] = {
                 "entry": stock["price"],
                 "time": now_utc,
@@ -438,7 +468,14 @@ def run_scan(session: str):
 
             rsi_str = f"{result['rsi']:.1f}" if result.get('rsi') else "N/A"
             vol_str = f"{result['vol_ratio']:.1f}x" if result.get('vol_ratio') else "-"
+            obv_str = result.get('obv_label', '-')
             ticker_link = naver_link(sym)
+
+            # 정규장: OBV 포함 / 프리·애프터: 거래량 표시
+            if session == "regular":
+                extra_line = f"📊 RSI: <b>{rsi_str}</b> | OBV: <b>{obv_str}</b>\n"
+            else:
+                extra_line = f"📊 RSI: <b>{rsi_str}</b>\n📦 거래량: <b>{vol_str}</b>\n"
 
             message = (
                 f"{session_label} <b>급등 신호!</b>\n"
@@ -448,30 +485,29 @@ def run_scan(session: str):
                 f"📉 전일종가: ${stock['prev_close']:.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
                 f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
-                f"📊 RSI: <b>{rsi_str}</b>\n"
-                f"📦 거래량: <b>{vol_str}</b>\n"
+                f"{extra_line}"
                 f"📥 진입가 기록: ${stock['price']:.2f}\n"
                 f"🎯 매도선: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f}) | 손절: -4%(${stock['price']*0.96:.2f})\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
             )
             send_telegram(message)
-            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | 진입가 ${stock['price']:.2f}")
+            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | OBV {obv_str} | 진입가 ${stock['price']:.2f}")
             time.sleep(0.5)
 
 
 def main():
     print("=" * 50)
-    print("🚀 급등 감지 봇 v10 시작!")
+    print("🚀 급등 감지 봇 v10 + OBV 시작!")
     print(f"🌃 주간거래: 상위 {OVERNIGHT_TOP_N}종목 | 일중 {OVERNIGHT_CHANGE}%+")
-    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+")
+    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+ | OBV 참고")
     print(f"🌅 프리/애프터: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print("=" * 50)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v10 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v10 + OBV 시작!</b>\n"
         f"🌃 주간: 일중 {OVERNIGHT_CHANGE}%+\n"
-        f"📈 정규장: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+\n"
+        f"📈 정규장: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+ | OBV 참고표시\n"
         f"🌅 프리/애프터: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+\n"
         f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절"
     )
