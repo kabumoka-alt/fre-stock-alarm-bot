@@ -127,7 +127,7 @@ def calc_rsi(bars: list, period: int = 14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def analyze_symbol(symbol: str, extended: bool = False):
+def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = False):
     """종목 분석. extended=True면 프리/애프터 조건 추가"""
     bars = get_bars(symbol, limit=30)
     if not bars or len(bars) < 6:
@@ -150,7 +150,10 @@ def analyze_symbol(symbol: str, extended: bool = False):
         vol_ok = "✅" if vol_ratio >= EXTENDED_VOLUME_MULT else "❌"
         print(f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok} | 거래량:{vol_ratio:.1f}x{vol_ok}")
 
-        if price_change_5m < EXTENDED_PRICE_CHANGE or vol_ratio < EXTENDED_VOLUME_MULT:
+        if price_change_5m < EXTENDED_PRICE_CHANGE:
+            return None
+        # overnight은 거래량 조건 미적용
+        if not is_overnight and vol_ratio < EXTENDED_VOLUME_MULT:
             return None
 
         return {"rsi": rsi, "price_change_5m": price_change_5m, "vol_ratio": vol_ratio}
@@ -196,7 +199,7 @@ def run_scan(session: str):
             if elapsed < COOLDOWN_MINUTES:
                 continue
 
-        result = analyze_symbol(sym, extended=is_extended)
+        result = analyze_symbol(sym, extended=is_extended, is_overnight=(session == "overnight"))
         if result is None:
             continue
 
