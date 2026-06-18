@@ -50,19 +50,25 @@ def send_telegram(message: str):
 
 
 def get_market_session():
-    """현재 장 세션 반환: 'pre', 'regular', 'after', 'closed'"""
+    """현재 장 세션 반환: 'pre', 'regular', 'after', 'overnight', 'closed'"""
     now_utc = datetime.now(timezone.utc)
-    now_et = now_utc + timedelta(hours=-4)  # 서머타임 UTC-4
-    if now_et.weekday() >= 5:
-        return "closed"
+    now_et = now_utc + timedelta(hours=-4)
+    weekday = now_et.weekday()  # 0=월, 6=일
     et_min = now_et.hour * 60 + now_et.minute
+
+    if weekday == 5:  # 토요일 전체 closed
+        return "closed"
+    if weekday == 6 and et_min < (20 * 60):  # 일요일 20시 이전 closed
+        return "closed"
+
     if (4 * 60) <= et_min < (9 * 60 + 30):
         return "pre"
     elif (9 * 60 + 30) <= et_min <= (16 * 60):
         return "regular"
     elif (16 * 60) < et_min <= (20 * 60):
         return "after"
-    return "closed"
+    else:
+        return "overnight"  # 20:00 ~ 04:00
 
 
 def get_active_symbols():
@@ -169,11 +175,11 @@ def run_scan(session: str):
         ranked.append({"symbol": sym, "price": daily["c"], "change_pct": change_pct})
 
     ranked = sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
-    is_extended = session in ("pre", "after")
+    is_extended = session in ("pre", "after", "overnight")
     top_n = EXTENDED_TOP_N if is_extended else REGULAR_TOP_N
     top = ranked[:top_n]
 
-    session_label = {"pre": "🌅 프리마켓", "regular": "📈 정규장", "after": "🌙 애프터마켓"}[session]
+    session_label = {"pre": "🌅 프리마켓", "regular": "📈 정규장", "after": "🌙 애프터마켓", "overnight": "🌃 주간거래"}[session]
     print(f"[{session_label}] 상위 {top_n}종목 스캔 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
 
     now_utc = datetime.now(timezone.utc)
@@ -225,13 +231,13 @@ def main():
     print("=" * 50)
     print("🚀 급등 감지 봇 v8 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | RSI {REGULAR_RSI}+")
-    print(f"🌅 프리/애프터: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+")
+    print(f"🌅 프리/애프터/주간: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+")
     print("=" * 50)
 
     send_telegram(
         f"🤖 <b>급등 감지 봇 v8 시작!</b>\n"
         f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | RSI {REGULAR_RSI}+\n"
-        f"🌅 프리/애프터: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+"
+        f"🌅 프리/애프터/주간: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+"
     )
 
     while True:
