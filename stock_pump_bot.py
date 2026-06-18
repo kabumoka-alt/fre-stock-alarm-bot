@@ -1,8 +1,10 @@
 """
-미국 주식 급등 감지 봇 v9
+미국 주식 급등 감지 봇 v10
 - 주간거래: 일중 상승률 27%+ 알림
 - 프리/정규/애프터: 5분봉 5%+ & RSI 50+ (실시간 호가 기준)
 - 티커 클릭 시 네이버 증권 연결
+- [NEW] 매도 타이밍 알림: +7% 1차, +15% 전량, -4% 손절
+- [NEW] 매도 알림 후에도 모니터링 유지 (재급등 재진입 대응)
 """
 
 import os
@@ -17,7 +19,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 주간거래 조건
 OVERNIGHT_TOP_N = 20
-OVERNIGHT_CHANGE = 27.0       # 일중 27%+
+OVERNIGHT_CHANGE = 27.0
 
 # 정규장 조건
 REGULAR_TOP_N = 50
@@ -25,23 +27,34 @@ REGULAR_RSI = 50
 
 # 프리/애프터 조건
 EXTENDED_TOP_N = 20
-EXTENDED_PRICE_CHANGE = 5.0   # 5분 5%+
+EXTENDED_PRICE_CHANGE = 5.0
 EXTENDED_RSI = 50
 EXTENDED_VOLUME_MULT = 1.5
 
 CHECK_INTERVAL = 60
 COOLDOWN_MINUTES = 30
 
+# 매도 알림 쿨다운 (같은 레벨 중복 알림 방지)
+SELL_COOLDOWN_MINUTES = 60
+
+# 매도 타이밍 임계값
+SELL_PARTIAL_PCT = 7.0    # +7% 1차 매도
+SELL_FULL_PCT = 15.0      # +15% 전량 매도
+STOP_LOSS_PCT = -4.0      # -4% 손절
+
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
 }
 
+# 급등 포착 시점 진입가 기록: {symbol: {"entry": price, "time": datetime, "alert1": datetime|None, "alert2": datetime|None, "stop": datetime|None}}
+entry_prices = {}
+
+# 급등 진입 알림 쿨다운: {symbol: datetime}
 last_alert = {}
 
 
 def naver_link(sym: str) -> str:
-    """네이버 증권 미국 주식 링크 생성"""
     return f'<a href="https://m.stock.naver.com/worldstock/stock/{sym}/total">{sym}</a>'
 
 
@@ -61,7 +74,7 @@ def send_telegram(message: str):
 
 def get_market_session():
     now_utc = datetime.now(timezone.utc)
-    now_et = now_utc + timedelta(hours=-4)  # 서머타임 UTC-4
+    now_et = now_utc + timedelta(hours=-4)
     weekday = now_et.weekday()
     et_min = now_et.hour * 60 + now_et.minute
 
@@ -109,7 +122,6 @@ def get_snapshots(symbols: list):
 
 
 def get_bars(symbol: str, limit: int = 30):
-    """1분봉 데이터 - feed 없이 최선 데이터 요청"""
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {"timeframe": "1Min", "limit": limit, "sort": "asc"}
     try:
@@ -118,7 +130,6 @@ def get_bars(symbol: str, limit: int = 30):
             bars = resp.json().get("bars", [])
             if bars:
                 return bars
-        # 실패시 iex로 재시도
         params["feed"] = "iex"
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if resp.status_code == 200:
@@ -145,7 +156,6 @@ def calc_rsi(bars: list, period: int = 14):
 
 
 def get_live_price(snap: dict):
-    """실시간 호가 우선 반환"""
     latest_trade = snap.get("latestTrade", {})
     minute_bar = snap.get("minuteBar", {})
     daily_bar = snap.get("dailyBar", {})
@@ -155,7 +165,6 @@ def get_live_price(snap: dict):
 
 
 def build_ranked(snapshots: dict):
-    """스냅샷으로 상승률 랭킹 생성 - 실시간 호가 기준"""
     ranked = []
     for sym, snap in snapshots.items():
         prev = snap.get("prevDailyBar", {})
@@ -180,14 +189,89 @@ def build_ranked(snapshots: dict):
     return sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
 
 
+def check_sell_timing(sym: str, current_price: float, price_source: str, session_label: str):
+    """
+    진입가 대비 현재가로 매도 타이밍 체크.
+    매도 알림 후에도 모니터링 유지 (재급등 재진입 대응).
+    같은 레벨은 SELL_COOLDOWN_MINUTES 쿨다운으로 중복 방지.
+    """
+    if sym not in entry_prices:
+        return
+
+    entry = entry_prices[sym]
+    entry_price = entry["entry"]
+    now_utc = datetime.now(timezone.utc)
+    now_kst = now_utc + timedelta(hours=9)
+
+    gain_pct = ((current_price - entry_price) / entry_price) * 100
+    ticker_link = naver_link(sym)
+
+    def cooldown_ok(key):
+        last = entry.get(key)
+        if last is None:
+            return True
+        return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
+
+    # 손절: -4% 이하
+    if gain_pct <= STOP_LOSS_PCT:
+        if cooldown_ok("stop"):
+            entry["stop"] = now_utc
+            msg = (
+                f"🔴 <b>손절 타이밍!</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📌 종목: <b>{ticker_link}</b>\n"
+                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
+                f"📥 진입가: ${entry_price:.2f}\n"
+                f"📉 수익률: <b>{gain_pct:+.2f}%</b>\n"
+                f"⚠️ -4% 손절 구간 진입\n"
+                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+            )
+            send_telegram(msg)
+            print(f"[🔴 손절 알림] {sym} | 진입가 ${entry_price:.2f} → 현재 ${current_price:.2f} ({gain_pct:+.2f}%)")
+        return
+
+    # 전량 매도: +15% 이상
+    if gain_pct >= SELL_FULL_PCT:
+        if cooldown_ok("alert2"):
+            entry["alert2"] = now_utc
+            msg = (
+                f"🟢 <b>전량 매도 타이밍!</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📌 종목: <b>{ticker_link}</b>\n"
+                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
+                f"📥 진입가: ${entry_price:.2f}\n"
+                f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
+                f"✅ +15% 전량 매도 구간\n"
+                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+            )
+            send_telegram(msg)
+            print(f"[🟢 전량매도 알림] {sym} | 진입가 ${entry_price:.2f} → 현재 ${current_price:.2f} ({gain_pct:+.2f}%)")
+        return
+
+    # 1차 매도: +7% 이상
+    if gain_pct >= SELL_PARTIAL_PCT:
+        if cooldown_ok("alert1"):
+            entry["alert1"] = now_utc
+            msg = (
+                f"🟡 <b>1차 매도 타이밍!</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📌 종목: <b>{ticker_link}</b>\n"
+                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
+                f"📥 진입가: ${entry_price:.2f}\n"
+                f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
+                f"💡 +7% → 절반 매도 후 나머지 홀드\n"
+                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+            )
+            send_telegram(msg)
+            print(f"[🟡 1차매도 알림] {sym} | 진입가 ${entry_price:.2f} → 현재 ${current_price:.2f} ({gain_pct:+.2f}%)")
+
+
 def analyze_regular(sym: str, snap: dict):
-    """정규장: 5분봉 5%+ & RSI 50+"""
     bars = get_bars(sym)
     if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
 
-    # 실시간 호가로 현재가 오버라이드
     latest_price, _ = get_live_price(snap)
     current_price = latest_price or float(bars[-1]["c"])
     price_5m_ago = float(bars[-6]["c"])
@@ -211,7 +295,6 @@ def analyze_regular(sym: str, snap: dict):
 
 
 def analyze_extended(sym: str, snap: dict, check_volume: bool = True):
-    """프리/애프터: 5분봉 5%+ & RSI 50+ & 거래량 1.5x+"""
     bars = get_bars(sym)
     if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
@@ -269,15 +352,24 @@ def run_scan(session: str):
         "overnight": "🌃 주간거래"
     }[session]
 
+    # ── 매도 타이밍 체크: 이미 진입가 기록된 종목들 ──
+    tracked_syms = list(entry_prices.keys())
+    if tracked_syms:
+        # 스냅샷에 없는 종목은 별도 조회
+        snap_map = {s["symbol"]: s for s in ranked}
+        for sym in tracked_syms:
+            if sym in snap_map:
+                stock = snap_map[sym]
+                check_sell_timing(sym, stock["price"], stock["price_source"], session_label)
+
     if session == "overnight":
-        # 주간거래: 일중 27%+ 즉시 알림
         top = ranked[:OVERNIGHT_TOP_N]
         print(f"[{session_label}] 상위 {OVERNIGHT_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
 
         for stock in top:
             sym = stock["symbol"]
             if stock["change_pct"] < OVERNIGHT_CHANGE:
-                break  # 정렬돼 있으므로 이하 전부 미달
+                break
 
             if sym in last_alert:
                 elapsed = (now_utc - last_alert[sym]).total_seconds() / 60
@@ -285,6 +377,16 @@ def run_scan(session: str):
                     continue
 
             last_alert[sym] = now_utc
+
+            # 진입가 기록 (신규 또는 재진입)
+            entry_prices[sym] = {
+                "entry": stock["price"],
+                "time": now_utc,
+                "alert1": None,
+                "alert2": None,
+                "stop": None
+            }
+
             ticker_link = naver_link(sym)
             message = (
                 f"{session_label} <b>급등 신호!</b>\n"
@@ -293,13 +395,14 @@ def run_scan(session: str):
                 f"💰 현재가({stock['price_source']}): <b>${stock['price']:.2f}</b>\n"
                 f"📉 전일종가: ${stock['prev_close']:.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
+                f"📥 진입가 기록: ${stock['price']:.2f}\n"
+                f"🎯 매도선: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f}) | 손절: -4%(${stock['price']*0.96:.2f})\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
             )
             send_telegram(message)
-            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}%")
+            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | 진입가 ${stock['price']:.2f}")
 
     else:
-        # 프리/정규/애프터: 5분봉 & RSI 체크
         top_n = REGULAR_TOP_N if session == "regular" else EXTENDED_TOP_N
         top = ranked[:top_n]
         print(f"[{session_label}] 상위 {top_n}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
@@ -323,6 +426,16 @@ def run_scan(session: str):
                 continue
 
             last_alert[sym] = now_utc
+
+            # 진입가 기록 (신규 또는 재진입)
+            entry_prices[sym] = {
+                "entry": stock["price"],
+                "time": now_utc,
+                "alert1": None,
+                "alert2": None,
+                "stop": None
+            }
+
             rsi_str = f"{result['rsi']:.1f}" if result.get('rsi') else "N/A"
             vol_str = f"{result['vol_ratio']:.1f}x" if result.get('vol_ratio') else "-"
             ticker_link = naver_link(sym)
@@ -337,26 +450,30 @@ def run_scan(session: str):
                 f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
                 f"📊 RSI: <b>{rsi_str}</b>\n"
                 f"📦 거래량: <b>{vol_str}</b>\n"
+                f"📥 진입가 기록: ${stock['price']:.2f}\n"
+                f"🎯 매도선: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f}) | 손절: -4%(${stock['price']*0.96:.2f})\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
             )
             send_telegram(message)
-            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str}")
+            print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | 진입가 ${stock['price']:.2f}")
             time.sleep(0.5)
 
 
 def main():
     print("=" * 50)
-    print("🚀 급등 감지 봇 v9 시작!")
+    print("🚀 급등 감지 봇 v10 시작!")
     print(f"🌃 주간거래: 상위 {OVERNIGHT_TOP_N}종목 | 일중 {OVERNIGHT_CHANGE}%+")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+")
     print(f"🌅 프리/애프터: 상위 {EXTENDED_TOP_N}종목 | 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+")
+    print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print("=" * 50)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v9 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v10 시작!</b>\n"
         f"🌃 주간: 일중 {OVERNIGHT_CHANGE}%+\n"
         f"📈 정규장: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {REGULAR_RSI}+\n"
-        f"🌅 프리/애프터: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+"
+        f"🌅 프리/애프터: 5분 {EXTENDED_PRICE_CHANGE}%+ | RSI {EXTENDED_RSI}+ | 거래량 {EXTENDED_VOLUME_MULT}x+\n"
+        f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절"
     )
 
     while True:
