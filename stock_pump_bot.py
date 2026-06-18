@@ -2,6 +2,7 @@
 미국 주식 급등 감지 봇 v9
 - 주간거래: 일중 상승률 27%+ 알림
 - 프리/정규/애프터: 5분봉 5%+ & RSI 50+ (실시간 호가 기준)
+- 티커 클릭 시 네이버 증권 연결
 """
 
 import os
@@ -37,6 +38,11 @@ HEADERS = {
 }
 
 last_alert = {}
+
+
+def naver_link(sym: str) -> str:
+    """네이버 증권 미국 주식 링크 생성"""
+    return f'<a href="https://m.stock.naver.com/worldstock/stock/{sym}/total">{sym}</a>'
 
 
 def send_telegram(message: str):
@@ -279,10 +285,11 @@ def run_scan(session: str):
                     continue
 
             last_alert[sym] = now_utc
+            ticker_link = naver_link(sym)
             message = (
                 f"{session_label} <b>급등 신호!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
-                f"📌 종목: <b>{sym}</b>\n"
+                f"📌 종목: <b>{ticker_link}</b>\n"
                 f"💰 현재가({stock['price_source']}): <b>${stock['price']:.2f}</b>\n"
                 f"📉 전일종가: ${stock['prev_close']:.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
@@ -318,11 +325,12 @@ def run_scan(session: str):
             last_alert[sym] = now_utc
             rsi_str = f"{result['rsi']:.1f}" if result.get('rsi') else "N/A"
             vol_str = f"{result['vol_ratio']:.1f}x" if result.get('vol_ratio') else "-"
+            ticker_link = naver_link(sym)
 
             message = (
                 f"{session_label} <b>급등 신호!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
-                f"📌 종목: <b>{sym}</b>\n"
+                f"📌 종목: <b>{ticker_link}</b>\n"
                 f"💰 현재가({stock['price_source']}): <b>${stock['price']:.2f}</b>\n"
                 f"📉 전일종가: ${stock['prev_close']:.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
