@@ -109,15 +109,15 @@ def sim_open(sym: str, price: float):
     print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f}")
 
 
-def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> float:
+def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     """
     포지션 청산 처리.
     qty=None 이면 전량 청산.
-    반환값: 실현 손익(달러). 완전 청산 아니면 0.0 반환.
+    반환값: 텔레그램에 붙일 시뮬 요약 문자열. 포지션 없으면 빈 문자열.
     """
     pos = sim_positions.get(sym)
     if not pos:
-        return 0.0
+        return ""
 
     close_qty = qty if qty is not None else pos["qty"]
     pnl = (exit_price - pos["entry"]) * close_qty
@@ -488,8 +488,8 @@ def run_scan():
         sim_line = (
             f"\n\n💹 <b>[시뮬 매수 기록]</b>\n"
             f"━━━━━━━━━━━━━━\n"
-            f"📥 1주 @ ${stock['price']:.2f} 매수 기록\n"
-            f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f})\n"
+            f"📥 2주 @ ${stock['price']:.2f} 매수 기록\n"
+            f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) 1주 절반매도 / +15%(${stock['price']*1.15:.2f}) 전량\n"
             f"🛑 손절가: -4%(${stock['price']*0.96:.2f})\n"
             f"💰 현재 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> "
             f"({sim_stats['wins']}승 {sim_stats['losses']}패)"
@@ -521,14 +521,14 @@ def main():
     print("🚀 급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
-    print(f"💹 시뮬: 매수 신호 시 1주 자동 기록, 먼저 걸리는 조건으로 청산")
+    print(f"💹 시뮬: 매수 신호 시 2주 자동 기록, +7% 1주 절반매도 → +15%/손절 나머지 청산")
     print("=" * 50)
 
     send_telegram(
         f"🤖 <b>급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!</b>\n"
         f"📈 정규장: 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고표시\n"
         f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
-        f"💹 시뮬모드: 매수 신호 → 1주 자동 기록 → 조건 충족 시 청산 + 손익 계산"
+        f"💹 시뮬모드: 매수 신호 → 2주 자동 기록 → +7% 1주 절반매도 / +15%·손절 전량 청산"
     )
 
     while True:
