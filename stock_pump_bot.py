@@ -1,10 +1,13 @@
 """
-미국 주식 급등 감지 봇 v11 (정규장 전용)
+미국 주식 급등 감지 봇 v12 (정규장 전용 + 시뮬레이션)
 - 정규장(09:30~16:00 ET)만 스캔
 - 5분봉 5%+ & RSI 50+ 조건
 - OBV 방향 참고 표시 (필터 아님)
 - 매도 타이밍: +7% 1차, +15% 전량, -4% 손절
 - 매도 후에도 모니터링 유지 (재진입 대응)
+- [v12 신규] 시뮬레이션: 매수 신호 시 1주 자동 매수 기록,
+  먼저 걸리는 매도 조건(+7%/+15%/-4%)으로 청산,
+  텔레그램에 건별 손익 + 누적 손익 전송
 """
 
 import os
@@ -41,6 +44,25 @@ HEADERS = {
 entry_prices = {}
 last_alert = {}
 
+# ──────────────────────────────────────────
+# 시뮬레이션 상태
+# ──────────────────────────────────────────
+# sim_positions: { sym: {"entry": float, "qty": int, "partial_done": bool} }
+# - partial_done: +7% 1차 매도(절반) 이미 처리했는지 여부
+sim_positions: dict = {}
+
+# sim_stats: 누적 통계
+sim_stats = {
+    "total_pnl": 0.0,   # 누적 손익 (달러)
+    "trades": 0,         # 완전 청산된 거래 수
+    "wins": 0,
+    "losses": 0,
+}
+
+
+# ──────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────
 
 def naver_link(sym: str) -> str:
     return f'<a href="https://m.stock.naver.com/worldstock/stock/{sym}/total">{sym}</a>'
@@ -70,6 +92,81 @@ def is_regular_session() -> bool:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
 
+
+# ──────────────────────────────────────────
+# 시뮬레이션 헬퍼
+# ──────────────────────────────────────────
+
+def sim_open(sym: str, price: float):
+    """매수 신호 → 1주 매수 기록"""
+    if sym in sim_positions:
+        return  # 이미 보유 중이면 중복 매수 안 함
+    sim_positions[sym] = {
+        "entry": price,
+        "qty": 1,
+        "partial_done": False,
+    }
+    print(f"  [시뮬 매수] {sym} 1주 @ ${price:.2f}")
+
+
+def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> float:
+    """
+    포지션 청산 처리.
+    qty=None 이면 전량 청산.
+    반환값: 실현 손익(달러). 완전 청산 아니면 0.0 반환.
+    """
+    pos = sim_positions.get(sym)
+    if not pos:
+        return 0.0
+
+    close_qty = qty if qty is not None else pos["qty"]
+    pnl = (exit_price - pos["entry"]) * close_qty
+    pnl_pct = ((exit_price - pos["entry"]) / pos["entry"]) * 100
+
+    pos["qty"] -= close_qty
+    if pos["qty"] <= 0:
+        del sim_positions[sym]
+        # 통계 업데이트
+        sim_stats["total_pnl"] += pnl
+        sim_stats["trades"] += 1
+        if pnl >= 0:
+            sim_stats["wins"] += 1
+        else:
+            sim_stats["losses"] += 1
+    else:
+        # 1차 매도(절반) 처리
+        pos["partial_done"] = True
+        sim_stats["total_pnl"] += pnl
+
+    win_rate = (
+        sim_stats["wins"] / sim_stats["trades"] * 100
+        if sim_stats["trades"] > 0 else 0.0
+    )
+
+    summary = (
+        f"\n\n💹 <b>[시뮬레이션]</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📤 청산: {reason} | {close_qty}주 @ ${exit_price:.2f}\n"
+        f"📥 진입가: ${pos['entry']:.2f}\n"
+        f"{'📈' if pnl >= 0 else '📉'} 건별 손익: <b>{'+'if pnl>=0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
+        f"💰 누적 손익: <b>{'+'if sim_stats['total_pnl']>=0 else ''}{sim_stats['total_pnl']:.2f}$</b>\n"
+        f"🏆 승/패: {sim_stats['wins']}승 {sim_stats['losses']}패 "
+        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래"
+    )
+    return summary
+
+
+def sim_status_line() -> str:
+    """현재 시뮬 보유 현황 한 줄 요약"""
+    if not sim_positions:
+        return "📭 시뮬 보유 없음"
+    items = [f"{s}({p['qty']}주@${p['entry']:.2f})" for s, p in sim_positions.items()]
+    return "📦 보유: " + " / ".join(items[:5])  # 최대 5개만 표시
+
+
+# ──────────────────────────────────────────
+# Alpaca API
+# ──────────────────────────────────────────
 
 def get_active_symbols():
     url = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
@@ -116,6 +213,10 @@ def get_bars(symbol: str, limit: int = 30):
     except:
         return []
 
+
+# ──────────────────────────────────────────
+# 지표 계산
+# ──────────────────────────────────────────
 
 def calc_rsi(bars: list, period: int = 14):
     if len(bars) < period + 1:
@@ -196,6 +297,10 @@ def build_ranked(snapshots: dict):
     return sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
 
 
+# ──────────────────────────────────────────
+# 매도 타이밍 체크 (알림 + 시뮬 청산)
+# ──────────────────────────────────────────
+
 def check_sell_timing(sym: str, current_price: float, price_source: str):
     if sym not in entry_prices:
         return
@@ -213,9 +318,16 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             return True
         return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
 
+    # ── 손절 ──
     if gain_pct <= STOP_LOSS_PCT:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
+
+            # 시뮬 청산
+            sim_note = ""
+            if sym in sim_positions:
+                sim_note = sim_close(sym, current_price, "손절(-4%)", qty=None)
+
             send_telegram(
                 f"🔴 <b>손절 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -225,13 +337,20 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📉 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"⚠️ -4% 손절 구간 진입\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+                + (sim_note if sim_note else "")
             )
             print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
+    # ── +15% 전량 매도 ──
     if gain_pct >= SELL_FULL_PCT:
         if cooldown_ok("alert2"):
             entry["alert2"] = now_utc
+
+            sim_note = ""
+            if sym in sim_positions:
+                sim_note = sim_close(sym, current_price, "+15% 전량", qty=None)
+
             send_telegram(
                 f"🟢 <b>전량 매도 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -241,13 +360,22 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"✅ +15% 전량 매도 구간\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+                + (sim_note if sim_note else "")
             )
             print(f"[🟢 전량매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
+    # ── +7% 1차 매도 ──
     if gain_pct >= SELL_PARTIAL_PCT:
         if cooldown_ok("alert1"):
             entry["alert1"] = now_utc
+
+            sim_note = ""
+            pos = sim_positions.get(sym)
+            if pos and not pos.get("partial_done"):
+                # 1주이므로 1차에 전량 청산 (0.5주 불가)
+                sim_note = sim_close(sym, current_price, "+7% 1차", qty=None)
+
             send_telegram(
                 f"🟡 <b>1차 매도 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -257,9 +385,14 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"💡 +7% → 절반 매도 후 나머지 홀드\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+                + (sim_note if sim_note else "")
             )
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
+
+# ──────────────────────────────────────────
+# 종목 분석
+# ──────────────────────────────────────────
 
 def analyze_regular(sym: str, snap: dict):
     bars = get_bars(sym)
@@ -289,6 +422,10 @@ def analyze_regular(sym: str, snap: dict):
     return {"rsi": rsi, "price_change_5m": price_change_5m, "obv_label": obv_label}
 
 
+# ──────────────────────────────────────────
+# 메인 스캔
+# ──────────────────────────────────────────
+
 def run_scan():
     symbols = get_active_symbols()
     if not symbols:
@@ -305,7 +442,7 @@ def run_scan():
     now_utc = datetime.now(timezone.utc)
     now_kst = now_utc + timedelta(hours=9)
 
-    # 매도 타이밍 체크
+    # 매도 타이밍 체크 (시뮬 청산 포함)
     snap_map = {s["symbol"]: s for s in ranked}
     for sym in list(entry_prices.keys()):
         if sym in snap_map:
@@ -314,6 +451,7 @@ def run_scan():
 
     top = ranked[:REGULAR_TOP_N]
     print(f"[정규장] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
+    print(f"  {sim_status_line()}")
 
     for stock in top:
         sym = stock["symbol"]
@@ -337,9 +475,25 @@ def run_scan():
             "stop": None
         }
 
+        # 시뮬 매수 기록
+        sim_open(sym, stock["price"])
+
         rsi_str = f"{result['rsi']:.1f}"
         obv_str = result["obv_label"]
         ticker_link = naver_link(sym)
+
+        # 누적 손익 한 줄 요약
+        total_pnl = sim_stats["total_pnl"]
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        sim_line = (
+            f"\n\n💹 <b>[시뮬 매수 기록]</b>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"📥 1주 @ ${stock['price']:.2f} 매수 기록\n"
+            f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f})\n"
+            f"🛑 손절가: -4%(${stock['price']*0.96:.2f})\n"
+            f"💰 현재 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> "
+            f"({sim_stats['wins']}승 {sim_stats['losses']}패)"
+        )
 
         message = (
             f"📈 정규장 <b>급등 신호!</b>\n"
@@ -350,26 +504,31 @@ def run_scan():
             f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
             f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
             f"📊 RSI: <b>{rsi_str}</b> | OBV: <b>{obv_str}</b>\n"
-            f"📥 진입가 기록: ${stock['price']:.2f}\n"
-            f"🎯 매도선: +7%(${stock['price']*1.07:.2f}) / +15%(${stock['price']*1.15:.2f}) | 손절: -4%(${stock['price']*0.96:.2f})\n"
             f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
+            + sim_line
         )
         send_telegram(message)
         print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | OBV {obv_str} | 진입가 ${stock['price']:.2f}")
         time.sleep(0.5)
 
 
+# ──────────────────────────────────────────
+# 진입점
+# ──────────────────────────────────────────
+
 def main():
     print("=" * 50)
-    print("🚀 급등 감지 봇 v11 (정규장 전용) 시작!")
+    print("🚀 급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
+    print(f"💹 시뮬: 매수 신호 시 1주 자동 기록, 먼저 걸리는 조건으로 청산")
     print("=" * 50)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v11 (정규장 전용) 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!</b>\n"
         f"📈 정규장: 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고표시\n"
-        f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절"
+        f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
+        f"💹 시뮬모드: 매수 신호 → 1주 자동 기록 → 조건 충족 시 청산 + 손익 계산"
     )
 
     while True:
