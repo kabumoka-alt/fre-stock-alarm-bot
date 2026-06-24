@@ -572,8 +572,8 @@ def analyze_regular(sym: str, snap: dict):
         f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
     )
 
-    # 진입 조건: 1분 상승 + RSI + 거래량 급등 모두 충족
-    if price_change_1m < PRICE_CHANGE_1M or rsi < REGULAR_RSI or not vol_ok:
+    # 진입 조건: 1분 상승 + 거래량 급등
+    if price_change_1m < PRICE_CHANGE_1M or not vol_ok:
         return None
 
     return {
