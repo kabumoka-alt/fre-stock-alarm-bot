@@ -711,7 +711,7 @@ def main():
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | RSI {REGULAR_RSI}+")
     print(f"📦 거래량 조건: 평균 대비 {VOLUME_SURGE_RATIO}x 이상")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
-    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & 0~+{SIDEWAYS_PCT}% 이내")
+    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
     print(f"🚫 손절 시 당일 블랙리스트 등록 (재진입 차단)")
     print("=" * 60)
 
