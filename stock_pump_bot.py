@@ -322,7 +322,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 def get_active_symbols():
     # [v21] most-actives(거래횟수) → movers(상승률 기준)으로 변경
     url    = "https://data.alpaca.markets/v1beta1/screener/stocks/movers"
-    params = {"top": 100}
+    params = {"top": 50}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if resp.status_code == 200:
