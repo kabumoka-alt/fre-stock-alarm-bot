@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v23 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v27 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -10,7 +10,7 @@
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
 - [v25] 저가주 필터: $1 미만 종목 진입 제외
-- [v25] 장마감(16:00 ET) 보유 종목 전량 강제 청산 후 최종 일지 전송
+- [v27] 워런트/유닛 제외: .WS, W로 끝나는 티커 등 파생상품 진입 차단
 """
 
 import os
@@ -335,6 +335,22 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 # Alpaca API
 # ──────────────────────────────────────────
 
+def is_warrant(sym: str) -> bool:
+    """
+    [v27] 워런트/유닛 등 파생 티커 판별.
+    - '.WS' 접미사 (예: TE.WS)
+    - 'W'로 끝나는 5글자 이상 티커 (예: EVLVW, AUROW, AFRIW)
+    - '.U', '.UN' 유닛, '.R' 라이트 등
+    """
+    s = sym.upper()
+    if any(suffix in s for suffix in (".WS", ".WT", ".U", ".UN", ".RT", ".R")):
+        return True
+    # W로 끝나는 5글자 이상 티커는 워런트일 가능성 높음
+    if len(s) >= 5 and s.endswith("W") and "." not in s:
+        return True
+    return False
+
+
 def get_active_symbols():
     # [v21] most-actives(거래횟수) → movers(상승률 기준)으로 변경
     url    = "https://data.alpaca.markets/v1beta1/screener/stocks/movers"
@@ -344,7 +360,12 @@ def get_active_symbols():
         if resp.status_code == 200:
             data    = resp.json()
             gainers = data.get("gainers", [])
-            return [d["symbol"] for d in gainers]
+            # [v27] 워런트/유닛 제외
+            symbols  = [d["symbol"] for d in gainers if not is_warrant(d["symbol"])]
+            excluded = [d["symbol"] for d in gainers if is_warrant(d["symbol"])]
+            if excluded:
+                print(f"  [워런트 제외] {excluded}")
+            return symbols
         print(f"[스크리너 오류] {resp.status_code}")
         return []
     except Exception as e:
@@ -433,17 +454,17 @@ def calc_obv(bars: list) -> str:
 
 def calc_volume_surge(bars: list) -> tuple[float, bool]:
     """
-    [v22] 거래량 급등 체크 — 5분 합산 기준.
-    최근 5봉 합산 거래량 vs 그 이전 20봉 평균×5 비교.
-    반환: (배율, 조건충족여부)
+    거래량 급등 체크 — 최근 5봉 합산 vs 그 이전 봉 평균×5 비교 (참고용 표시).
+    봉 수가 적으면 가용 데이터로 계산. 반환: (배율, 조건충족여부)
     """
-    if len(bars) < 26:   # 5봉 + 이전 20봉 + 여유 1봉
+    if len(bars) < 6:
         return 0.0, False
     recent_5   = bars[-5:]           # 최근 5봉
-    history_20 = bars[-26:-5]        # 그 이전 20봉 (겹치지 않게)
-    if not history_20:
+    history    = bars[:-5]           # 그 이전 전체 (최대 20봉으로 제한)
+    history    = history[-20:]
+    if not history:
         return 0.0, False
-    avg_vol_per_bar = sum(float(b["v"]) for b in history_20) / len(history_20)
+    avg_vol_per_bar = sum(float(b["v"]) for b in history) / len(history)
     if avg_vol_per_bar <= 0:
         return 0.0, False
     recent_vol  = sum(float(b["v"]) for b in recent_5)
@@ -568,7 +589,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
 
 def analyze_regular(sym: str, snap: dict):
     bars = get_bars(sym)
-    if not bars or len(bars) < 26:
+    if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
 
@@ -585,30 +606,27 @@ def analyze_regular(sym: str, snap: dict):
         return None
 
     price_change_1m    = ((current_price - price_1m_ago) / price_1m_ago) * 100
-    rsi                = calc_rsi(bars)
-    if rsi is None:
-        return None
+    rsi                = calc_rsi(bars)   # None일 수 있음 (봉 부족), 참고용 표시만
 
-    # [v14] 거래량 급등 체크
+    # 거래량/OBV/ATR (모두 참고용)
     vol_ratio, vol_ok  = calc_volume_surge(bars)
     obv_label          = calc_obv(bars)
+    atr                = calc_atr(bars)
 
-    # [v17] ATR 계산
-    atr = calc_atr(bars)
-
+    rsi_disp     = f"{rsi:.1f}" if rsi is not None else "N/A"
     price_ok_str = "✅" if price_change_1m >= PRICE_CHANGE_1M else "❌"
     vol_ok_str   = "✅" if vol_ok else "❌"
     print(
-        f"  └ RSI:{rsi:.1f} | 1분:{price_change_1m:+.2f}%{price_ok_str} "
+        f"  └ RSI:{rsi_disp} | 1분:{price_change_1m:+.2f}%{price_ok_str} "
         f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
     )
 
-    # 진입 조건: 1분 상승
+    # 진입 조건: 1분 상승만
     if price_change_1m < PRICE_CHANGE_1M:
         return None
 
     return {
-        "rsi":             rsi,
+        "rsi":             rsi if rsi is not None else 0.0,
         "price_change_1m": price_change_1m,
         "obv_label":       obv_label,
         "vol_ratio":       vol_ratio,
@@ -770,7 +788,7 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v25 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v27 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
@@ -779,7 +797,7 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v25 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v27 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
