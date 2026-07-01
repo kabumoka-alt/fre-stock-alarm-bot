@@ -9,7 +9,8 @@
 - [v18] 횡보 청산: 매수 후 10분 경과 & +3~+7% 구간 시 전량 청산
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
-- [v23] 손절 블랙리스트 → 종목당 손절 횟수 제한으로 전환 (2회까지 재진입 허용, 3회째부터 당일 차단)
+- [v25] 저가주 필터: $1 미만 종목 진입 제외
+- [v25] 장마감(16:00 ET) 보유 종목 전량 강제 청산 후 최종 일지 전송
 """
 
 import os
@@ -27,10 +28,12 @@ REGULAR_TOP_N        = 30
 REGULAR_RSI          = 50
 PRICE_CHANGE_1M      = 3.0
 VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 기준
+MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
 
 CHECK_INTERVAL        = 60
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
+MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
 
 # 매도 타이밍 임계값
 SELL_PARTIAL_PCT = 7.0
@@ -571,6 +574,12 @@ def analyze_regular(sym: str, snap: dict):
 
     latest_price, _ = get_live_price(snap)
     current_price   = latest_price or float(bars[-1]["c"])
+
+    # [v25] 저가주 필터: $1 미만 제외
+    if current_price < MIN_PRICE:
+        print(f"  └ 저가주 제외: ${current_price:.2f} < ${MIN_PRICE}")
+        return None
+
     price_1m_ago    = float(bars[-2]["c"])
     if price_1m_ago <= 0:
         return None
@@ -625,6 +634,18 @@ def check_scheduled_reports():
     # ── 장 종료 최종 일지 (16:00~16:02 ET, 1회) ──
     if et_hour == 16 and et_min <= 2 and not market_close_sent:
         market_close_sent = True
+
+        # [v25] 보유 종목 전량 현재가로 강제 청산
+        if sim_positions:
+            held = list(sim_positions.keys())
+            snaps = get_snapshots(held)
+            for sym in held:
+                snap = snaps.get(sym, {})
+                price, _ = get_live_price(snap)
+                if price:
+                    sim_close(sym, float(price), "장마감 강제청산", qty=None)
+                    print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
+
         print("[📊 장마감 최종 매매일지 전송]")
         send_telegram(build_trade_report("🔔 장 종료 최종 매매일지"))
         return
@@ -661,6 +682,21 @@ def run_scan():
     now_kst = now_utc + timedelta(hours=9)
 
     snap_map = {s["symbol"]: s for s in ranked}
+
+    # ── [v24] 보유 종목 독립 가격 체크 ──
+    # snap_map에 없는 보유 종목도 별도 스냅샷 조회하여 손절/매도 체크
+    held_syms_not_in_scan = [
+        sym for sym in list(entry_prices.keys()) if sym not in snap_map
+    ]
+    if held_syms_not_in_scan:
+        extra_snaps = get_snapshots(held_syms_not_in_scan)
+        for sym, snap in extra_snaps.items():
+            price, source = get_live_price(snap)
+            if price:
+                check_sell_timing(sym, float(price), source)
+        print(f"  [보유종목 독립체크] {held_syms_not_in_scan} — {len(held_syms_not_in_scan)}개")
+
+    # 스캔 대상에 있는 보유 종목 체크
     for sym in list(entry_prices.keys()):
         if sym in snap_map:
             stock = snap_map[sym]
@@ -672,7 +708,7 @@ def run_scan():
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
-    # [v17] 상위 10종목 ATR 계산 후 높은 순으로 재정렬
+    # ATR 계산 후 높은 순으로 재정렬
     top_with_atr = []
     for stock in top:
         sym = stock["symbol"]
@@ -686,6 +722,9 @@ def run_scan():
     print(f"  [ATR 재정렬] " + " | ".join(
         f"{s['symbol']}({s['_atr']:.3f})" for s in top_with_atr[:5]
     ))
+
+    # ── [v24] 스캔당 최대 MAX_BUY_PER_SCAN 종목만 신규 매수 ──
+    bought_this_scan = 0
 
     for stock in top_with_atr:
         sym = stock["symbol"]
@@ -707,8 +746,14 @@ def run_scan():
             "sideways_done": False,
         }
 
-        bought      = sim_open(sym, stock["price"])
-        ticker_link = naver_link(sym)
+        # 매수 제한 체크
+        if bought_this_scan >= MAX_BUY_PER_SCAN:
+            print(f"  [매수 제한] {sym} — 이번 스캔 {MAX_BUY_PER_SCAN}종목 초과, 스킵")
+            continue
+
+        bought = sim_open(sym, stock["price"])
+        if bought:
+            bought_this_scan += 1
 
         print(
             f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
@@ -725,17 +770,19 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v23 (정규장 전용 + 시뮬 + 매매일지) 시작!")
-    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+")
+    print("🚀 급등 감지 봇 v25 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
+    print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v23 시작!</b>\n"
-        f"📈 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
+        f"🤖 <b>급등 감지 봇 v25 시작!</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
+        f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
