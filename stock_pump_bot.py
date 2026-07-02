@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v30 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v31 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -11,6 +11,10 @@
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
 - [v25] 저가주 필터: $1 미만 종목 진입 제외
 - [v30] 예수금 배분 방식 변경: 30% 고정 → 남은 슬롯 균등 분배 (예수금 ÷ 남은 슬롯)
+- [v31] 개장 변동성 구간(09:30~10:30 ET) 공격 모드: 진입 2%, 1차 +9%, 전량 +20%, 손절 -6%
+- [v32] 초저가주($3 미만) 보유 시 15초 주기 빠른 가격 체크 (스캔 사이 갭 하락 대응)
+- [v33] ETF/펀드/레버리지 상품 진입 제외 (종목명 키워드 필터)
+- [v33] 일간 +30% 급등주 눌림목 재진입: 고점 -15% 조정 후 1분 +1.5% 반등 시 진입
 """
 
 import os
@@ -31,15 +35,39 @@ VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 
 MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
 
 CHECK_INTERVAL        = 60
+
+# [v32] 초저가주 빠른 체크: 보유 종목 중 저가주는 스캔 사이에도 짧은 주기로 가격 확인
+# (저가주는 유동성이 얇아 1분 사이 -10% → -30% 갭 하락이 실제로 발생했음: TC 사례)
+FAST_CHECK_PRICE      = 3.0   # 이 가격 미만 보유 종목은 빠른 체크 대상
+FAST_CHECK_INTERVAL   = 15    # 빠른 체크 주기 (초)
+
+# [v33] ETF/펀드 제외 필터 (종목명 기반, Alpaca 자산정보 조회 + 캐시)
+# 주의: "SHARES"는 일반 ADR(American Depositary Shares)까지 걸러버리므로 제외
+ETF_NAME_KEYWORDS = ("ETF", "ETN", "FUND", "TRUST", "INDEX", "2X", "3X",
+                     "BULL", "BEAR", "LEVERAGED", "INVERSE", "PROSHARES", "DIREXION")
+
+# [v33] 일간 급등주 눌림목 재진입
+PULLBACK_MIN_DAY_GAIN   = 30.0   # 감시 등록 기준: 일간 등락률 30% 이상
+PULLBACK_DROP_PCT       = 15.0   # 장중 고점 대비 15% 이상 조정 시 재진입 후보
+PULLBACK_BOUNCE_1M      = 1.5    # 조정 후 1분봉 +1.5% 반등 시 진입
+PULLBACK_WATCH_MAX      = 10     # 감시 종목 최대 수
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
 MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
 MAX_POSITIONS         = 7    # [v29] 동시 보유 최대 종목 수
 
-# 매도 타이밍 임계값
+# 매도 타이밍 임계값 (평소)
 SELL_PARTIAL_PCT = 7.0
 SELL_FULL_PCT    = 15.0
 STOP_LOSS_PCT    = -10.0
+
+# [v31] 개장 변동성 구간(09:30~10:30 ET) 공격 모드 파라미터
+AGGRESSIVE_START_MIN        = 9 * 60 + 30   # 09:30 ET
+AGGRESSIVE_END_MIN          = 10 * 60 + 30  # 10:30 ET
+AGGRESSIVE_PRICE_CHANGE_1M  = 2.0    # 진입 조건 완화: 3.0% → 2.0%
+AGGRESSIVE_SELL_PARTIAL_PCT = 9.0    # 1차 매도 목표 상향: 7.0% → 9.0%
+AGGRESSIVE_SELL_FULL_PCT    = 20.0   # 전량 매도 목표 상향: 15.0% → 20.0%
+AGGRESSIVE_STOP_LOSS_PCT    = -6.0   # 손절 타이트하게: -10.0% → -6.0%
 
 # [v18] 횡보 청산 조건
 SIDEWAYS_MINUTES = 10
@@ -149,6 +177,34 @@ def is_regular_session() -> bool:
     if now_et.weekday() >= 5:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
+
+
+def is_aggressive_window() -> bool:
+    """개장 직후 변동성 구간(09:30~10:30 ET) 여부."""
+    now_et = get_et_now()
+    et_min = now_et.hour * 60 + now_et.minute
+    if now_et.weekday() >= 5:
+        return False
+    return AGGRESSIVE_START_MIN <= et_min <= AGGRESSIVE_END_MIN
+
+
+def get_active_thresholds() -> dict:
+    """현재 시간대(공격모드/평소)에 맞는 진입·매도 임계값 반환."""
+    if is_aggressive_window():
+        return {
+            "price_change_1m": AGGRESSIVE_PRICE_CHANGE_1M,
+            "sell_partial_pct": AGGRESSIVE_SELL_PARTIAL_PCT,
+            "sell_full_pct": AGGRESSIVE_SELL_FULL_PCT,
+            "stop_loss_pct": AGGRESSIVE_STOP_LOSS_PCT,
+            "mode": "🔥공격",
+        }
+    return {
+        "price_change_1m": PRICE_CHANGE_1M,
+        "sell_partial_pct": SELL_PARTIAL_PCT,
+        "sell_full_pct": SELL_FULL_PCT,
+        "stop_loss_pct": STOP_LOSS_PCT,
+        "mode": "평시",
+    }
 
 
 # ──────────────────────────────────────────
@@ -368,6 +424,10 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 
 
 # ──────────────────────────────────────────
+# [v32] 실계좌 자동매매 — 주문 실행
+# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────
 # Alpaca API
 # ──────────────────────────────────────────
 
@@ -385,6 +445,30 @@ def is_warrant(sym: str) -> bool:
     if len(s) >= 5 and s.endswith("W") and "." not in s:
         return True
     return False
+
+
+_asset_name_cache = {}   # sym -> 종목명 (ETF 판별용, 하루 단위로 충분히 유효)
+
+def is_etf(sym: str) -> bool:
+    """
+    [v33] ETF/펀드/레버리지 상품 판별 (종목명 키워드 기반).
+    Alpaca 자산정보 API로 종목명을 조회해 캐시하고, 이름에 ETF성 키워드가 있으면 제외.
+    조회 실패 시 False (일반 종목으로 간주).
+    """
+    if sym in _asset_name_cache:
+        name = _asset_name_cache[sym]
+    else:
+        try:
+            resp = requests.get(
+                f"https://api.alpaca.markets/v2/assets/{sym}",
+                headers=HEADERS, timeout=10,
+            )
+            name = resp.json().get("name", "") if resp.status_code == 200 else ""
+        except Exception:
+            name = ""
+        _asset_name_cache[sym] = name
+    upper = name.upper()
+    return any(kw in upper for kw in ETF_NAME_KEYWORDS)
 
 
 def get_active_symbols():
@@ -574,6 +658,12 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     gain_pct    = ((current_price - entry_price) / entry_price) * 100
     ticker_link = naver_link(sym)
 
+    # [v31] 진입 당시 기록해둔 시간대별(공격모드/평시) 매도 임계값 사용
+    th               = entry.get("thresholds") or get_active_thresholds()
+    sell_partial_pct = th["sell_partial_pct"]
+    sell_full_pct    = th["sell_full_pct"]
+    stop_loss_pct    = th["stop_loss_pct"]
+
     def cooldown_ok(key):
         last = entry.get(key)
         if last is None:
@@ -591,31 +681,31 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             return
 
     # ── 손절 ──
-    if gain_pct <= STOP_LOSS_PCT:
+    if gain_pct <= stop_loss_pct:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
             if sym in sim_positions:
-                sim_close(sym, current_price, "손절(-10%)", qty=None)
+                sim_close(sym, current_price, f"손절({stop_loss_pct:.0f}%)", qty=None)
             print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
-    # ── +15% 전량 매도 ──
-    if gain_pct >= SELL_FULL_PCT:
+    # ── 전량 매도 ──
+    if gain_pct >= sell_full_pct:
         if cooldown_ok("alert2"):
             entry["alert2"] = now_utc
             if sym in sim_positions:
-                sim_close(sym, current_price, "+15% 전량", qty=None)
+                sim_close(sym, current_price, f"+{sell_full_pct:.0f}% 전량", qty=None)
             print(f"[🟢 전량매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
-    # ── +7% 1차 매도 ──
-    if gain_pct >= SELL_PARTIAL_PCT:
+    # ── 1차 매도(절반) ──
+    if gain_pct >= sell_partial_pct:
         if cooldown_ok("alert1"):
             entry["alert1"] = now_utc
             pos = sim_positions.get(sym)
             if pos and not pos.get("partial_done"):
                 half = max(1, pos["qty"] // 2)
-                sim_close(sym, current_price, "+7% 1차(절반)", qty=half)
+                sim_close(sym, current_price, f"+{sell_partial_pct:.0f}% 1차(절반)", qty=half)
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
 
@@ -649,16 +739,20 @@ def analyze_regular(sym: str, snap: dict):
     obv_label          = calc_obv(bars)
     atr                = calc_atr(bars)
 
+    # [v31] 시간대별(공격모드/평시) 진입 임계값
+    th           = get_active_thresholds()
+    entry_th     = th["price_change_1m"]
+
     rsi_disp     = f"{rsi:.1f}" if rsi is not None else "N/A"
-    price_ok_str = "✅" if price_change_1m >= PRICE_CHANGE_1M else "❌"
+    price_ok_str = "✅" if price_change_1m >= entry_th else "❌"
     vol_ok_str   = "✅" if vol_ok else "❌"
     print(
-        f"  └ RSI:{rsi_disp} | 1분:{price_change_1m:+.2f}%{price_ok_str} "
+        f"  └ [{th['mode']}] RSI:{rsi_disp} | 1분:{price_change_1m:+.2f}%(기준{entry_th}%){price_ok_str} "
         f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
     )
 
-    # 진입 조건: 1분 상승만
-    if price_change_1m < PRICE_CHANGE_1M:
+    # 진입 조건: 1분 상승만 (시간대별 임계값 적용)
+    if price_change_1m < entry_th:
         return None
 
     return {
@@ -721,6 +815,113 @@ def check_scheduled_reports():
 # 메인 스캔
 # ──────────────────────────────────────────
 
+def fast_check_low_priced():
+    """
+    [v32] 보유 종목 중 초저가주(FAST_CHECK_PRICE 미만)만 골라 가격을 확인하고
+    손절/익절 타이밍을 체크한다. 메인 스캔(60초) 사이의 갭 하락을 잡기 위함.
+    반환: 체크한 종목 수
+    """
+    low_syms = [
+        sym for sym, e in entry_prices.items()
+        if e["entry"] < FAST_CHECK_PRICE and sym in sim_positions
+    ]
+    if not low_syms:
+        return 0
+    snaps = get_snapshots(low_syms)
+    checked = 0
+    for sym, snap in snaps.items():
+        price, source = get_live_price(snap)
+        if price:
+            check_sell_timing(sym, float(price), source)
+            checked += 1
+    return checked
+
+
+# [v33] 일간 급등주 눌림목 감시: sym -> {"high": 장중 최고 관측가, "day_gain": 등록 시 등락률}
+pullback_watch = {}
+
+def update_pullback_watch(ranked: list):
+    """일간 +30% 이상 급등 종목을 감시 목록에 등록/갱신 (ETF·워런트·저가주 제외)."""
+    for stock in ranked:
+        sym = stock["symbol"]
+        if stock["change_pct"] < PULLBACK_MIN_DAY_GAIN:
+            continue
+        if stock["price"] < MIN_PRICE or sym in blacklisted_today:
+            continue
+        if is_warrant(sym) or is_etf(sym):
+            continue
+        if sym in pullback_watch:
+            # 장중 고점 갱신
+            if stock["price"] > pullback_watch[sym]["high"]:
+                pullback_watch[sym]["high"] = stock["price"]
+        elif len(pullback_watch) < PULLBACK_WATCH_MAX:
+            pullback_watch[sym] = {"high": stock["price"], "day_gain": stock["change_pct"]}
+            print(f"  [👀 눌림감시 등록] {sym} (일간 {stock['change_pct']:+.1f}%, 고점 ${stock['price']:.2f})")
+
+
+def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> int:
+    """
+    감시 종목 중 '고점 대비 -15% 이상 조정 후 1분봉 +1.5% 반등' 시 재진입.
+    반환: 이번 스캔 누적 매수 수
+    """
+    for sym in list(pullback_watch.keys()):
+        if bought_this_scan >= MAX_BUY_PER_SCAN:
+            break
+        if sym in entry_prices or sym in blacklisted_today:
+            continue
+        if sym in last_alert:
+            elapsed = (now_utc - last_alert[sym]).total_seconds() / 60
+            if elapsed < COOLDOWN_MINUTES:
+                continue
+
+        stock = snap_map.get(sym)
+        if stock:
+            price = stock["price"]
+        else:
+            snaps = get_snapshots([sym])
+            snap  = snaps.get(sym)
+            if not snap:
+                continue
+            price, _ = get_live_price(snap)
+            if not price:
+                continue
+
+        watch = pullback_watch[sym]
+        if price > watch["high"]:
+            watch["high"] = price
+            continue
+
+        drop_pct = ((watch["high"] - price) / watch["high"]) * 100
+        if drop_pct < PULLBACK_DROP_PCT:
+            continue
+
+        # 조정 확인됨 → 1분봉 반등 체크
+        bars = get_bars(sym)
+        if not bars or len(bars) < 2:
+            continue
+        prev_c = float(bars[-2]["c"])
+        bounce = ((price - prev_c) / prev_c) * 100
+        if bounce < PULLBACK_BOUNCE_1M:
+            continue
+
+        # 재진입!
+        last_alert[sym] = now_utc
+        entry_prices[sym] = {
+            "entry": price, "time": now_utc,
+            "alert1": None, "alert2": None, "stop": None,
+            "sideways_done": False,
+            "thresholds": get_active_thresholds(),
+        }
+        if sim_open(sym, price):
+            bought_this_scan += 1
+            print(
+                f"[🎯 눌림재진입] {sym} | 고점 ${watch['high']:.2f} 대비 -{drop_pct:.1f}% 조정 후 "
+                f"1분 +{bounce:.2f}% 반등 | 진입가 ${price:.2f}"
+            )
+        del pullback_watch[sym]   # 진입했으면 감시 해제
+    return bought_this_scan
+
+
 def run_scan():
     symbols = get_active_symbols()
     if not symbols:
@@ -757,20 +958,27 @@ def run_scan():
             check_sell_timing(sym, stock["price"], stock["price_source"])
 
     top = ranked[:REGULAR_TOP_N]
-    print(f"[정규장] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
+    mode_now = get_active_thresholds()["mode"]
+    print(f"[정규장/{mode_now}] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
     print(f"  {holdings_block().replace(chr(10), ' | ')}")
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
     # ATR 계산 후 높은 순으로 재정렬
     top_with_atr = []
+    etf_excluded = []
     for stock in top:
         sym = stock["symbol"]
         if sym in blacklisted_today:
             continue
+        if is_etf(sym):                     # [v33] ETF/펀드/레버리지 제외
+            etf_excluded.append(sym)
+            continue
         bars = get_bars(sym)
         atr  = calc_atr(bars) if bars else 0.0
         top_with_atr.append({**stock, "_atr": atr})
+    if etf_excluded:
+        print(f"  [ETF 제외] {', '.join(etf_excluded)}")
 
     top_with_atr.sort(key=lambda x: x["_atr"], reverse=True)
     print(f"  [ATR 재정렬] " + " | ".join(
@@ -798,6 +1006,7 @@ def run_scan():
             "entry": stock["price"], "time": now_utc,
             "alert1": None, "alert2": None, "stop": None,
             "sideways_done": False,
+            "thresholds": get_active_thresholds(),   # [v31] 진입 당시 시간대 기준 고정
         }
 
         # 매수 제한 체크
@@ -815,6 +1024,14 @@ def run_scan():
         )
         time.sleep(0.5)
 
+    # ── [v33] 일간 급등주 눌림목 감시/재진입 ──
+    update_pullback_watch(ranked)
+    if pullback_watch:
+        print(f"  [눌림감시 중] " + " | ".join(
+            f"{s}(고점${w['high']:.2f})" for s, w in pullback_watch.items()
+        ))
+    bought_this_scan = check_pullback_entries(snap_map, now_utc, bought_this_scan)
+
 
 # ──────────────────────────────────────────
 # 진입점
@@ -824,9 +1041,13 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v30 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v31 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
+    print(
+        f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
+        f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절"
+    )
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
     print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
@@ -834,8 +1055,10 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v30 시작!</b>\n"
-        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
+        f"🤖 <b>급등 감지 봇 v31 시작!</b>\n"
+        f"📈 평시 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
+        f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
+        f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
         f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
@@ -855,17 +1078,28 @@ def main():
             if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
-                print("[리셋] 블랙리스트 및 손절 카운트 초기화 (새 장 시작)")
+                pullback_watch.clear()   # [v33] 눌림감시 목록도 새 장마다 초기화
+                print("[리셋] 블랙리스트/손절카운트/눌림감시 초기화 (새 장 시작)")
 
         check_scheduled_reports()
 
         if not is_regular_session():
             print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
+            time.sleep(CHECK_INTERVAL)
         else:
             print(f"\n[{now_str}] 정규장 스캔 시작")
             run_scan()
 
-        time.sleep(CHECK_INTERVAL)
+            # [v32] 다음 스캔까지 60초 대기하는 동안, 초저가주 보유 시 15초마다 가격 체크
+            waited = 0
+            while waited < CHECK_INTERVAL:
+                time.sleep(FAST_CHECK_INTERVAL)
+                waited += FAST_CHECK_INTERVAL
+                if waited >= CHECK_INTERVAL:
+                    break
+                n = fast_check_low_priced()
+                if n:
+                    print(f"  [⚡빠른체크] 초저가주 {n}종목 가격 확인")
 
 
 if __name__ == "__main__":
