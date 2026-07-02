@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v31 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v34 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -15,12 +15,21 @@
 - [v32] 초저가주($3 미만) 보유 시 15초 주기 빠른 가격 체크 (스캔 사이 갭 하락 대응)
 - [v33] ETF/펀드/레버리지 상품 진입 제외 (종목명 키워드 필터)
 - [v33] 일간 +30% 급등주 눌림목 재진입: 고점 -15% 조정 후 1분 +1.5% 반등 시 진입
+- [v34] 본전 스탑: 1차매도 후 남은 물량은 본전(0%) 이탈 시 청산 (이긴 거래의 손실 전환 방지)
+- [v34] 유령 포지션 버그 수정: 전량 청산 시 entry_prices도 함께 삭제
+- [v34] 서머타임 자동 대응: UTC-4 하드코딩 → zoneinfo America/New_York
+- [v34] 진입 필수조건 추가: 분당 거래대금 $50k 이상 + 최신 1분봉 2분 이내(낡은 봉 차단)
+- [v34] 시뮬 슬리피지 반영: 매수/매도 체결가에 불리한 방향으로 0.2~0.5% 적용
+- [v34] trade_log/알림기록 일일 초기화 (매매일지 무한 누적 방지)
 """
 
 import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+ET_TZ = ZoneInfo("America/New_York")   # [v34] 서머타임 자동 반영
 
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
@@ -45,6 +54,17 @@ FAST_CHECK_INTERVAL   = 15    # 빠른 체크 주기 (초)
 # 주의: "SHARES"는 일반 ADR(American Depositary Shares)까지 걸러버리므로 제외
 ETF_NAME_KEYWORDS = ("ETF", "ETN", "FUND", "TRUST", "INDEX", "2X", "3X",
                      "BULL", "BEAR", "LEVERAGED", "INVERSE", "PROSHARES", "DIREXION")
+
+# [v34] 진입 필수조건: 분당 거래대금 & 봉 신선도
+MIN_DOLLAR_VOL_1M   = 50_000   # 최근 1분봉 거래대금 $50k 미만이면 진입 금지 (유동성 스파이크 차단)
+MAX_BAR_AGE_SEC     = 120      # 마지막 1분봉이 2분 이상 오래됐으면 진입 금지 (낡은 데이터 차단)
+
+# [v34] 시뮬 슬리피지 (관측가 대비 불리한 체결 가정)
+SLIPPAGE_LOW_PRICE_PCT  = 0.5  # $3 미만 저가주: ±0.5%
+SLIPPAGE_NORMAL_PCT     = 0.2  # 일반 종목: ±0.2%
+
+# [v34] 본전 스탑: 1차매도 후 남은 물량의 손절선을 본전으로 상향
+BREAKEVEN_STOP_PCT  = 0.0
 
 # [v33] 일간 급등주 눌림목 재진입
 PULLBACK_MIN_DAY_GAIN   = 30.0   # 감시 등록 기준: 일간 등락률 30% 이상
@@ -168,7 +188,8 @@ def send_telegram(message: str):
 
 
 def get_et_now():
-    return datetime.now(timezone.utc) + timedelta(hours=-4)
+    # [v34] 서머타임(EDT/EST) 자동 반영
+    return datetime.now(ET_TZ)
 
 
 def is_regular_session() -> bool:
@@ -317,6 +338,13 @@ def build_trade_report(title: str) -> str:
 # 시뮬레이션 헬퍼
 # ──────────────────────────────────────────
 
+def apply_slippage(price: float, side: str) -> float:
+    """[v34] 관측가에 불리한 방향으로 슬리피지 적용. side: 'buy'|'sell'"""
+    pct = SLIPPAGE_LOW_PRICE_PCT if price < FAST_CHECK_PRICE else SLIPPAGE_NORMAL_PCT
+    factor = 1 + pct / 100 if side == "buy" else 1 - pct / 100
+    return price * factor
+
+
 def sim_open(sym: str, price: float) -> bool:
     """매수 신호 → 남은 슬롯 균등 분배 방식으로 매수 (예수금 ÷ 남은 슬롯)."""
     if sym in sim_positions:
@@ -328,23 +356,28 @@ def sim_open(sym: str, price: float) -> bool:
     if len(sim_positions) >= MAX_POSITIONS:
         print(f"  [시뮬 매수 불가] {sym} — 보유 종목 {len(sim_positions)}개 (최대 {MAX_POSITIONS}개)")
         return False
+    # [v34] 매수 체결가에 슬리피지 반영 (관측가보다 불리하게)
+    fill_price = apply_slippage(price, "buy")
     # [v30] 남은 슬롯에 예수금 균등 분배
     remaining_slots = MAX_POSITIONS - len(sim_positions)
     budget          = sim_stats["cash"] / remaining_slots
-    qty             = int(budget // price)
+    qty             = int(budget // fill_price)
     if qty < 1:
-        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={price:.2f})")
+        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={fill_price:.2f})")
         return False
-    cost = price * qty
+    cost = fill_price * qty
     sim_stats["cash"] -= cost
-    sim_positions[sym] = {"entry": price, "qty": qty, "partial_done": False}
+    sim_positions[sym] = {"entry": fill_price, "qty": qty, "partial_done": False}
+    # entry_prices의 진입가도 체결가 기준으로 동기화
+    if sym in entry_prices:
+        entry_prices[sym]["entry"] = fill_price
     now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
     trade_log.append({
-        "action": "BUY", "sym": sym, "qty": qty, "price": price,
+        "action": "BUY", "sym": sym, "qty": qty, "price": fill_price,
         "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
         "time_kst": now_kst.strftime("%H:%M"),
     })
-    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (슬롯예산={cost:.2f}, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
+    print(f"  [시뮬 매수] {sym} {qty}주 @ ${fill_price:.2f} (관측가 ${price:.2f}+슬리피지, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
     return True
 
 
@@ -359,6 +392,9 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     if not pos:
         return ""
 
+    # [v34] 매도 체결가에 슬리피지 반영 (관측가보다 불리하게)
+    exit_price  = apply_slippage(exit_price, "sell")
+
     entry_price = pos["entry"]   # 청산 전에 미리 저장
     close_qty   = qty if qty is not None else pos["qty"]
     pnl         = (exit_price - entry_price) * close_qty
@@ -369,6 +405,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 
     if pos["qty"] <= 0:
         del sim_positions[sym]
+        entry_prices.pop(sym, None)   # [v34] 유령 포지션 버그 수정: 추적 정보도 함께 삭제
         sim_stats["total_pnl"] += pnl
         sim_stats["trades"]    += 1
         if pnl >= 0:
@@ -664,6 +701,11 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     sell_full_pct    = th["sell_full_pct"]
     stop_loss_pct    = th["stop_loss_pct"]
 
+    # [v34] 본전 스탑: 1차매도가 나갔으면 남은 물량 손절선을 본전으로 상향
+    breakeven_armed = entry.get("breakeven_armed", False)
+    if breakeven_armed:
+        stop_loss_pct = BREAKEVEN_STOP_PCT
+
     def cooldown_ok(key):
         last = entry.get(key)
         if last is None:
@@ -680,13 +722,15 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
             return
 
-    # ── 손절 ──
+    # ── 손절 / 본전스탑 ──
     if gain_pct <= stop_loss_pct:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
+            reason = "본전스탑" if breakeven_armed else f"손절({stop_loss_pct:.0f}%)"
             if sym in sim_positions:
-                sim_close(sym, current_price, f"손절({stop_loss_pct:.0f}%)", qty=None)
-            print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+                sim_close(sym, current_price, reason, qty=None)
+            icon = "⚖️" if breakeven_armed else "🔴"
+            print(f"[{icon} {reason}] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
     # ── 전량 매도 ──
@@ -706,6 +750,8 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             if pos and not pos.get("partial_done"):
                 half = max(1, pos["qty"] // 2)
                 sim_close(sym, current_price, f"+{sell_partial_pct:.0f}% 1차(절반)", qty=half)
+                entry["breakeven_armed"] = True   # [v34] 남은 물량은 본전 이탈 시 청산
+                print(f"  [⚖️ 본전스탑 활성] {sym} — 남은 물량 손절선 → 진입가")
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
 
@@ -713,10 +759,26 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
 # 종목 분석
 # ──────────────────────────────────────────
 
+def last_bar_age_sec(bars: list) -> float:
+    """[v34] 마지막 1분봉의 경과 시간(초). 파싱 실패 시 매우 큰 값."""
+    try:
+        t = bars[-1]["t"].replace("Z", "+00:00")
+        bar_time = datetime.fromisoformat(t)
+        return (datetime.now(timezone.utc) - bar_time).total_seconds()
+    except Exception:
+        return 999999.0
+
+
 def analyze_regular(sym: str, snap: dict):
     bars = get_bars(sym)
     if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
+        return None
+
+    # [v34] 낡은 봉 차단: 마지막 1분봉이 2분 이상 오래된 종목은 데이터 신뢰 불가
+    bar_age = last_bar_age_sec(bars)
+    if bar_age > MAX_BAR_AGE_SEC:
+        print(f"  └ 낡은 봉 제외: 마지막 봉 {bar_age:.0f}초 전 (기준 {MAX_BAR_AGE_SEC}초)")
         return None
 
     latest_price, _ = get_live_price(snap)
@@ -753,6 +815,12 @@ def analyze_regular(sym: str, snap: dict):
 
     # 진입 조건: 1분 상승만 (시간대별 임계값 적용)
     if price_change_1m < entry_th:
+        return None
+
+    # [v34] 분당 거래대금 필수조건: 최근 3봉 중 최대 거래대금이 기준 미달이면 진입 금지
+    recent_dv = max(float(b["v"]) * float(b["c"]) for b in bars[-3:])
+    if recent_dv < MIN_DOLLAR_VOL_1M:
+        print(f"  └ 거래대금 부족: 분당 ${recent_dv:,.0f} < ${MIN_DOLLAR_VOL_1M:,} — 진입 금지")
         return None
 
     return {
@@ -793,6 +861,8 @@ def check_scheduled_reports():
                 if price:
                     sim_close(sym, float(price), "장마감 강제청산", qty=None)
                     print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
+
+        entry_prices.clear()   # [v34] 알림 전용 추적 포함 전체 정리
 
         print("[📊 장마감 최종 매매일지 전송]")
         send_telegram(build_trade_report("🔔 장 종료 최종 매매일지"))
@@ -898,6 +968,8 @@ def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> in
         # 조정 확인됨 → 1분봉 반등 체크
         bars = get_bars(sym)
         if not bars or len(bars) < 2:
+            continue
+        if last_bar_age_sec(bars) > MAX_BAR_AGE_SEC:   # [v34] 낡은 봉 차단
             continue
         prev_c = float(bars[-2]["c"])
         bounce = ((price - prev_c) / prev_c) * 100
@@ -1041,7 +1113,7 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v31 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v34 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(
@@ -1055,7 +1127,7 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v31 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v34 시작!</b>\n"
         f"📈 평시 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
         f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
@@ -1063,6 +1135,8 @@ def main():
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
+        f"⚖️ 1차매도 후 본전스탑 | 💧 분당 거래대금 ${MIN_DOLLAR_VOL_1M//1000}k+ 필수\n"
+        f"🧾 시뮬 체결가 슬리피지 반영 ({SLIPPAGE_NORMAL_PCT}~{SLIPPAGE_LOW_PRICE_PCT}%)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
 
@@ -1075,11 +1149,16 @@ def main():
             if market_close_sent:
                 market_close_sent = False
                 print("[리셋] 장마감 플래그 초기화")
-            if blacklisted_today or stop_loss_count:
+            if blacklisted_today or stop_loss_count or trade_log or last_alert:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
                 pullback_watch.clear()   # [v33] 눌림감시 목록도 새 장마다 초기화
-                print("[리셋] 블랙리스트/손절카운트/눌림감시 초기화 (새 장 시작)")
+                trade_log.clear()        # [v34] 매매일지 일일 초기화 (무한 누적 방지)
+                last_alert.clear()       # [v34] 쿨다운 기록 초기화
+                # 포지션 없는 잔여 추적 정보 정리 (장마감 청산 실패 대비)
+                for s in [s for s in entry_prices if s not in sim_positions]:
+                    del entry_prices[s]
+                print("[리셋] 블랙리스트/손절카운트/눌림감시/일지/쿨다운 초기화 (새 장 시작)")
 
         check_scheduled_reports()
 
