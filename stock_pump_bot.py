@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v36 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v37 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -28,6 +28,13 @@
 - [v35] 손절 카운트 주석/코드 정합 (3회째 차단 명시)
 - [v35] 슬리피지 가격대별 차등 현실화 ($1미만 5% / $1~3 2% / $3~10 1% / $10+ 0.3%)
 - [v36] 개장 안정화 구간: 09:30~09:35 ET 신규 진입 금지 (첫 5분 고변동 회피, 보유 매도는 정상)
+- [v37] ★ 트레일링 되돌림 청산(Trailing Giveback Exit) 추가 — 시뮬 테스트용
+        · 보유 중 최고 수익률(peak_gain)을 실시간 추적
+        · peak_gain이 TRAIL_ARM_PCT(진입가 대비 +5%) 이상 찍힌 뒤,
+          고점 대비 TRAIL_GIVEBACK_PCT(40%) 이상 반납하면 즉시 전량 청산
+        · 기존 손절/전량/1차매도/횡보청산보다 우선 체크 (반전 초입에 선제 대응)
+        · 목적: 급등주 특유의 "블로우오프 탑 → 급반전" 패턴에서
+          손절선(-6~-10%)까지 반납분을 다 태우기 전에 이탈
 """
 
 import os
@@ -78,6 +85,10 @@ def slippage_pct_for(price: float) -> float:
 
 # [v34] 본전 스탑: 1차매도 후 남은 물량의 손절선을 본전으로 상향
 BREAKEVEN_STOP_PCT  = 0.0
+
+# [v37] 트레일링 되돌림 청산 파라미터
+TRAIL_ARM_PCT       = 5.0    # 이 수익률(%) 이상을 한 번이라도 찍어야 트레일링 활성화 (노이즈 방지)
+TRAIL_GIVEBACK_PCT  = 40.0   # 고점 수익률 대비 이 비율(%) 이상 반납 시 청산
 
 # [v33] 일간 급등주 눌림목 재진입
 PULLBACK_MIN_DAY_GAIN   = 30.0   # 감시 등록 기준: 일간 등락률 30% 이상
@@ -209,7 +220,7 @@ _market_open_cache = {"date": None, "value": False}
 
 def is_market_holiday_or_closed() -> bool:
     """
-    [v37] Alpaca Clock API로 미국 공휴일/휴장일 여부 확인.
+    Alpaca Clock API로 미국 공휴일/휴장일 여부 확인.
     같은 날짜에 대해 결과를 캐싱하여 API 호출을 최소화한다.
     API 호출 실패 시에는 휴장으로 단정하지 않고 False를 반환하여
     기존 요일 판단 로직만 적용되도록 한다.
@@ -526,10 +537,6 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 
 
 # ──────────────────────────────────────────
-# [v32] 실계좌 자동매매 — 주문 실행
-# ──────────────────────────────────────────
-
-# ──────────────────────────────────────────
 # Alpaca API
 # ──────────────────────────────────────────
 
@@ -823,6 +830,27 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             return True
         return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
 
+    # ── [v37] 트레일링 되돌림 청산 (고점 대비 큰 폭 반납 시 선제 이탈) ──
+    # 손절/횡보청산보다 먼저 체크한다: 급등주는 "천천히 반납"이 아니라
+    # "고점 찍고 몇 분 안에 급반전"하는 경우가 많아, 절대 손실선(-6~-10%)
+    # 이나 고정 시간(10분) 조건을 기다리면 이미 많이 반납한 뒤일 수 있다.
+    peak_gain = max(entry.get("peak_gain", gain_pct), gain_pct)
+    entry["peak_gain"] = peak_gain
+
+    if peak_gain >= TRAIL_ARM_PCT and gain_pct > stop_loss_pct:
+        giveback_ratio = (peak_gain - gain_pct) / peak_gain if peak_gain > 0 else 0.0
+        if giveback_ratio >= TRAIL_GIVEBACK_PCT / 100:
+            if cooldown_ok("trail"):
+                entry["trail"] = now_utc
+                reason = f"트레일링청산(고점{peak_gain:+.1f}%→{gain_pct:+.1f}%)"
+                if sym in sim_positions:
+                    sim_close(sym, current_price, reason, qty=None)
+                print(
+                    f"[🟠 트레일링청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} "
+                    f"| 고점 {peak_gain:+.2f}% → 현재 {gain_pct:+.2f}% (반납 {giveback_ratio*100:.0f}%)"
+                )
+            return
+
     # ── 횡보 청산 (매수 후 10분 경과 & +3~+7% 미만) ──
     elapsed_min = (now_utc - entry["time"]).total_seconds() / 60
     if elapsed_min >= SIDEWAYS_MINUTES and not entry.get("sideways_done"):
@@ -1096,6 +1124,7 @@ def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> in
             "entry": price, "time": now_utc,
             "alert1": None, "alert2": None, "stop": None,
             "sideways_done": False,
+            "peak_gain": 0.0,   # [v37] 트레일링 되돌림 청산용 고점 수익률 추적
             "thresholds": get_active_thresholds(),
         }
         if sim_open(sym, price):
@@ -1212,6 +1241,7 @@ def run_scan():
             "entry": entry_px, "time": now_utc,
             "alert1": None, "alert2": None, "stop": None,
             "sideways_done": False,
+            "peak_gain": 0.0,   # [v37] 트레일링 되돌림 청산용 고점 수익률 추적
             "thresholds": get_active_thresholds(),   # [v31] 진입 당시 시간대 기준 고정
         }
 
@@ -1244,7 +1274,7 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v36 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v37 (정규장 전용 + 시뮬 + 매매일지 + 트레일링청산) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(
@@ -1252,18 +1282,20 @@ def main():
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절"
     )
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
+    print(f"🟠 [v37] 트레일링청산: 고점 +{TRAIL_ARM_PCT}% 이상 찍은 뒤 고점 대비 {TRAIL_GIVEBACK_PCT:.0f}% 반납 시 즉시 청산")
     print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v36 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v37 (트레일링청산 시뮬) 시작!</b>\n"
         f"📈 평시 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
         f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
         f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → 점수(1분상승×0.7+거래량×0.3) 순 진입\n"
+        f"🟠 트레일링청산: 고점 +{TRAIL_ARM_PCT}% 도달 후 {TRAIL_GIVEBACK_PCT:.0f}% 반납 시 선제 청산 (신규)\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"⚖️ 1차매도 후 본전스탑 | 💧 분당 거래대금 ${MIN_DOLLAR_VOL_1M//1000}k+ 필수\n"
