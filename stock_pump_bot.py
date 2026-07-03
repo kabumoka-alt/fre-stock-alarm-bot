@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v34 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v36 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -21,6 +21,13 @@
 - [v34] 진입 필수조건 추가: 분당 거래대금 $50k 이상 + 최신 1분봉 2분 이내(낡은 봉 차단)
 - [v34] 시뮬 슬리피지 반영: 매수/매도 체결가에 불리한 방향으로 0.2~0.5% 적용
 - [v34] trade_log/알림기록 일일 초기화 (매매일지 무한 누적 방지)
+- [v35] ★ 낡은 봉 필터 오작동 수정: 종목 92% 차단 → 매매 0건 문제 해결
+        · 현재가/1분변동을 스냅샷 실시간체결가(latestTrade) 기준으로 계산 (봉은 보조)
+        · 신선도 판단을 '봉 나이' → '마지막 체결 시각(latestTrade.t)'으로 교체
+- [v35] 정렬 기준 변경: ATR 순 → (1분상승률×0.7 + 거래량비×0.3) 가중 점수
+- [v35] 손절 카운트 주석/코드 정합 (3회째 차단 명시)
+- [v35] 슬리피지 가격대별 차등 현실화 ($1미만 5% / $1~3 2% / $3~10 1% / $10+ 0.3%)
+- [v36] 개장 안정화 구간: 09:30~09:35 ET 신규 진입 금지 (첫 5분 고변동 회피, 보유 매도는 정상)
 """
 
 import os
@@ -55,13 +62,19 @@ FAST_CHECK_INTERVAL   = 15    # 빠른 체크 주기 (초)
 ETF_NAME_KEYWORDS = ("ETF", "ETN", "FUND", "TRUST", "INDEX", "2X", "3X",
                      "BULL", "BEAR", "LEVERAGED", "INVERSE", "PROSHARES", "DIREXION")
 
-# [v34] 진입 필수조건: 분당 거래대금 & 봉 신선도
+# [v34] 진입 필수조건: 분당 거래대금
 MIN_DOLLAR_VOL_1M   = 50_000   # 최근 1분봉 거래대금 $50k 미만이면 진입 금지 (유동성 스파이크 차단)
-MAX_BAR_AGE_SEC     = 120      # 마지막 1분봉이 2분 이상 오래됐으면 진입 금지 (낡은 데이터 차단)
 
-# [v34] 시뮬 슬리피지 (관측가 대비 불리한 체결 가정)
-SLIPPAGE_LOW_PRICE_PCT  = 0.5  # $3 미만 저가주: ±0.5%
-SLIPPAGE_NORMAL_PCT     = 0.2  # 일반 종목: ±0.2%
+# [v35] 신선도 판단: 마지막 '체결' 시각 기준 (봉 나이가 아님)
+# 저유동성 종목은 봉이 몇 시간 전일 수 있으나, 지금 실제 거래되면 latestTrade는 최신임
+MAX_TRADE_AGE_SEC   = 90       # 마지막 체결이 90초 이상 전이면 '죽은 종목'으로 진입 금지
+
+# [v35] 시뮬 슬리피지 가격대별 차등 (급등주 현실 반영: 저가일수록 호가 벌어짐)
+def slippage_pct_for(price: float) -> float:
+    if price < 1.0:   return 5.0   # $1 미만: 극단적 슬리피지
+    if price < 3.0:   return 2.0   # $1~3
+    if price < 10.0:  return 1.0   # $3~10
+    return 0.3                     # $10+
 
 # [v34] 본전 스탑: 1차매도 후 남은 물량의 손절선을 본전으로 상향
 BREAKEVEN_STOP_PCT  = 0.0
@@ -123,7 +136,7 @@ sim_stats = {
 # [v23] 종목당 손절 횟수 제한으로 전환
 # stop_loss_count[sym] = 당일 손절 횟수, MAX_STOP_LOSS_COUNT 도달 시 당일 블랙리스트
 stop_loss_count: dict = {}
-MAX_STOP_LOSS_COUNT = 2   # 2회까지는 재진입 허용, 3회째 손절부터 당일 차단
+MAX_STOP_LOSS_COUNT = 2   # [v35] cnt > 2, 즉 3회째 손절부터 당일 차단 (1·2회는 재진입 허용)
 
 # 손절 횟수가 MAX_STOP_LOSS_COUNT 이상 도달한 종목 (실질 블랙리스트)
 blacklisted_today: set = set()
@@ -207,6 +220,17 @@ def is_aggressive_window() -> bool:
     if now_et.weekday() >= 5:
         return False
     return AGGRESSIVE_START_MIN <= et_min <= AGGRESSIVE_END_MIN
+
+
+ENTRY_BLOCK_UNTIL_MIN = 9 * 60 + 35   # [v36] 09:35 ET까지 신규 진입 금지
+
+def is_entry_allowed() -> bool:
+    """[v36] 신규 진입 허용 여부. 개장 직후 5분(09:30~09:35)은 고변동이라 진입 금지."""
+    now_et = get_et_now()
+    et_min = now_et.hour * 60 + now_et.minute
+    if now_et.weekday() >= 5:
+        return False
+    return et_min >= ENTRY_BLOCK_UNTIL_MIN
 
 
 def get_active_thresholds() -> dict:
@@ -339,8 +363,8 @@ def build_trade_report(title: str) -> str:
 # ──────────────────────────────────────────
 
 def apply_slippage(price: float, side: str) -> float:
-    """[v34] 관측가에 불리한 방향으로 슬리피지 적용. side: 'buy'|'sell'"""
-    pct = SLIPPAGE_LOW_PRICE_PCT if price < FAST_CHECK_PRICE else SLIPPAGE_NORMAL_PCT
+    """[v35] 관측가에 불리한 방향으로 가격대별 슬리피지 적용. side: 'buy'|'sell'"""
+    pct = slippage_pct_for(price)
     factor = 1 + pct / 100 if side == "buy" else 1 - pct / 100
     return price * factor
 
@@ -655,8 +679,54 @@ def get_live_price(snap: dict):
     mb     = snap.get("minuteBar",   {})
     db     = snap.get("dailyBar",    {})
     price  = lt.get("p") or mb.get("c") or db.get("c")
-    source = "호가" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
+    source = "체결" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
     return price, source
+
+
+def latest_trade_age_sec(snap: dict) -> float:
+    """[v35] 스냅샷의 마지막 체결(latestTrade.t) 경과 시간(초). 없으면 큰 값."""
+    lt = snap.get("latestTrade", {})
+    t  = lt.get("t")
+    if not t:
+        # 체결 정보 없으면 minuteBar 시각으로 폴백
+        mb = snap.get("minuteBar", {})
+        t  = mb.get("t")
+    if not t:
+        return 999999.0
+    try:
+        ts = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return 999999.0
+
+
+def snap_1m_change(snap: dict, bars: list):
+    """
+    [v35] 1분 변동률 계산. 현재가는 스냅샷 실시간체결가 우선.
+    비교 기준(1분 전 가격)은:
+      1) minuteBar.o (현재 진행중 분봉 시가) 가 있으면 사용 — 봉 나이와 무관하게 최신
+      2) 없으면 봉 데이터 bars[-2].c 로 폴백
+    반환: (current_price, price_1m_ago, change_pct) 또는 None
+    """
+    lt = snap.get("latestTrade", {})
+    mb = snap.get("minuteBar", {})
+    current = lt.get("p") or mb.get("c")
+    if not current:
+        return None
+    current = float(current)
+
+    ref = None
+    # minuteBar 시가: 지금 진행 중인 1분봉의 시작가 → 실시간성 보장
+    if mb.get("o"):
+        ref = float(mb["o"])
+    elif bars and len(bars) >= 1:
+        # 현재가는 스냅샷(실시간)에서 오므로, 비교 기준은 '직전 완성봉 종가'(=실질 1분 전)
+        ref = float(bars[-1]["c"])
+    if not ref or ref <= 0:
+        return None
+
+    change = ((current - ref) / ref) * 100
+    return current, ref, change
 
 
 def build_ranked(snapshots: dict):
@@ -770,58 +840,54 @@ def last_bar_age_sec(bars: list) -> float:
 
 
 def analyze_regular(sym: str, snap: dict):
-    bars = get_bars(sym)
-    if not bars or len(bars) < 6:
-        print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
+    # [v35] 신선도: 마지막 '체결' 시각 기준 (봉 나이 아님) — 지금 실제 거래되는 종목만
+    trade_age = latest_trade_age_sec(snap)
+    if trade_age > MAX_TRADE_AGE_SEC:
+        print(f"  └ 거래 정지 제외: 마지막 체결 {trade_age:.0f}초 전 (기준 {MAX_TRADE_AGE_SEC}초)")
         return None
 
-    # [v34] 낡은 봉 차단: 마지막 1분봉이 2분 이상 오래된 종목은 데이터 신뢰 불가
-    bar_age = last_bar_age_sec(bars)
-    if bar_age > MAX_BAR_AGE_SEC:
-        print(f"  └ 낡은 봉 제외: 마지막 봉 {bar_age:.0f}초 전 (기준 {MAX_BAR_AGE_SEC}초)")
-        return None
+    bars = get_bars(sym)   # 지표(거래량/OBV/RSI)용 보조 데이터. 없어도 진입 가능
+    has_bars = bool(bars and len(bars) >= 6)
 
-    latest_price, _ = get_live_price(snap)
-    current_price   = latest_price or float(bars[-1]["c"])
+    # [v35] 1분 변동률: 스냅샷 실시간체결가 우선 (봉이 낡아도 정확)
+    ch = snap_1m_change(snap, bars if has_bars else [])
+    if ch is None:
+        print(f"  └ 가격 계산 불가 (스냅샷/봉 모두 부족)")
+        return None
+    current_price, price_1m_ago, price_change_1m = ch
 
     # [v25] 저가주 필터: $1 미만 제외
     if current_price < MIN_PRICE:
         print(f"  └ 저가주 제외: ${current_price:.2f} < ${MIN_PRICE}")
         return None
 
-    price_1m_ago    = float(bars[-2]["c"])
-    if price_1m_ago <= 0:
-        return None
-
-    price_change_1m    = ((current_price - price_1m_ago) / price_1m_ago) * 100
-    rsi                = calc_rsi(bars)   # None일 수 있음 (봉 부족), 참고용 표시만
-
-    # 거래량/OBV/ATR (모두 참고용)
-    vol_ratio, vol_ok  = calc_volume_surge(bars)
-    obv_label          = calc_obv(bars)
-    atr                = calc_atr(bars)
+    # 지표 (모두 참고/보조용)
+    rsi       = calc_rsi(bars)       if has_bars else None
+    vol_ratio, vol_ok = calc_volume_surge(bars) if has_bars else (0.0, False)
+    obv_label = calc_obv(bars)       if has_bars else "-"
+    atr       = calc_atr(bars)       if has_bars else 0.0
 
     # [v31] 시간대별(공격모드/평시) 진입 임계값
-    th           = get_active_thresholds()
-    entry_th     = th["price_change_1m"]
+    th       = get_active_thresholds()
+    entry_th = th["price_change_1m"]
 
     rsi_disp     = f"{rsi:.1f}" if rsi is not None else "N/A"
     price_ok_str = "✅" if price_change_1m >= entry_th else "❌"
-    vol_ok_str   = "✅" if vol_ok else "❌"
     print(
-        f"  └ [{th['mode']}] RSI:{rsi_disp} | 1분:{price_change_1m:+.2f}%(기준{entry_th}%){price_ok_str} "
-        f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
+        f"  └ [{th['mode']}] 1분:{price_change_1m:+.2f}%(기준{entry_th}%){price_ok_str} "
+        f"| RSI:{rsi_disp} | 거래량:{vol_ratio:.1f}x | ATR:{atr:.3f} | OBV:{obv_label} | 체결{trade_age:.0f}s前"
     )
 
-    # 진입 조건: 1분 상승만 (시간대별 임계값 적용)
+    # 진입 조건: 1분 상승 (시간대별 임계값)
     if price_change_1m < entry_th:
         return None
 
-    # [v34] 분당 거래대금 필수조건: 최근 3봉 중 최대 거래대금이 기준 미달이면 진입 금지
-    recent_dv = max(float(b["v"]) * float(b["c"]) for b in bars[-3:])
-    if recent_dv < MIN_DOLLAR_VOL_1M:
-        print(f"  └ 거래대금 부족: 분당 ${recent_dv:,.0f} < ${MIN_DOLLAR_VOL_1M:,} — 진입 금지")
-        return None
+    # [v34→35] 분당 거래대금 필수조건 (봉 있을 때만 체크; 없으면 통과)
+    if has_bars:
+        recent_dv = max(float(b["v"]) * float(b["c"]) for b in bars[-3:])
+        if recent_dv < MIN_DOLLAR_VOL_1M:
+            print(f"  └ 거래대금 부족: 분당 ${recent_dv:,.0f} < ${MIN_DOLLAR_VOL_1M:,} — 진입 금지")
+            return None
 
     return {
         "rsi":             rsi if rsi is not None else 0.0,
@@ -829,6 +895,7 @@ def analyze_regular(sym: str, snap: dict):
         "obv_label":       obv_label,
         "vol_ratio":       vol_ratio,
         "atr":             atr,
+        "current_price":   current_price,   # [v35] 스냅샷 기준 현재가 (진입가로 사용)
     }
 
 
@@ -947,6 +1014,7 @@ def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> in
         stock = snap_map.get(sym)
         if stock:
             price = stock["price"]
+            snap_for_age = stock["snap"]
         else:
             snaps = get_snapshots([sym])
             snap  = snaps.get(sym)
@@ -955,6 +1023,11 @@ def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> in
             price, _ = get_live_price(snap)
             if not price:
                 continue
+            snap_for_age = snap
+
+        # [v35] 거래 정지 종목 제외 (마지막 체결 시각 기준)
+        if latest_trade_age_sec(snap_for_age) > MAX_TRADE_AGE_SEC:
+            continue
 
         watch = pullback_watch[sym]
         if price > watch["high"]:
@@ -965,14 +1038,12 @@ def check_pullback_entries(snap_map: dict, now_utc, bought_this_scan: int) -> in
         if drop_pct < PULLBACK_DROP_PCT:
             continue
 
-        # 조정 확인됨 → 1분봉 반등 체크
+        # 조정 확인됨 → 1분봉 반등 체크 (스냅샷 minuteBar 우선)
         bars = get_bars(sym)
-        if not bars or len(bars) < 2:
+        ch = snap_1m_change(snap_for_age, bars if (bars and len(bars) >= 2) else [])
+        if ch is None:
             continue
-        if last_bar_age_sec(bars) > MAX_BAR_AGE_SEC:   # [v34] 낡은 봉 차단
-            continue
-        prev_c = float(bars[-2]["c"])
-        bounce = ((price - prev_c) / prev_c) * 100
+        _, _, bounce = ch
         if bounce < PULLBACK_BOUNCE_1M:
             continue
 
@@ -1036,8 +1107,8 @@ def run_scan():
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
-    # ATR 계산 후 높은 순으로 재정렬
-    top_with_atr = []
+    # [v35] 가중 점수(1분상승률×0.7 + 거래량비×0.3)로 재정렬 — 급등 초입 우선
+    scored = []
     etf_excluded = []
     for stock in top:
         sym = stock["symbol"]
@@ -1046,19 +1117,31 @@ def run_scan():
         if is_etf(sym):                     # [v33] ETF/펀드/레버리지 제외
             etf_excluded.append(sym)
             continue
+        # 스냅샷 기준 1분 변동 + 거래량비 (봉은 보조)
         bars = get_bars(sym)
-        atr  = calc_atr(bars) if bars else 0.0
-        top_with_atr.append({**stock, "_atr": atr})
+        ch = snap_1m_change(stock["snap"], bars if (bars and len(bars) >= 2) else [])
+        pc_1m = ch[2] if ch else 0.0
+        vr, _ = calc_volume_surge(bars) if (bars and len(bars) >= 6) else (0.0, False)
+        score = pc_1m * 0.7 + min(vr, 5.0) * 0.3
+        scored.append({**stock, "_score": score, "_pc1m": pc_1m, "_vr": vr})
     if etf_excluded:
         print(f"  [ETF 제외] {', '.join(etf_excluded)}")
 
-    top_with_atr.sort(key=lambda x: x["_atr"], reverse=True)
-    print(f"  [ATR 재정렬] " + " | ".join(
-        f"{s['symbol']}({s['_atr']:.3f})" for s in top_with_atr[:5]
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    top_with_atr = scored   # 이후 루프 호환용 이름 유지
+    print(f"  [점수 재정렬] " + " | ".join(
+        f"{s['symbol']}({s['_score']:.1f}|{s['_pc1m']:+.1f}%,{s['_vr']:.1f}x)" for s in scored[:5]
     ))
 
     # ── [v24] 스캔당 최대 MAX_BUY_PER_SCAN 종목만 신규 매수 ──
     bought_this_scan = 0
+
+    # [v36] 개장 직후 5분은 신규 진입 금지 (보유 종목 매도는 위에서 이미 처리됨)
+    if not is_entry_allowed():
+        print("  [개장 안정화 구간] 09:35 ET 전 — 신규 진입 보류 (매도는 정상)")
+        # 눌림감시 목록은 계속 갱신해두되, 재진입 매수는 하지 않음
+        update_pullback_watch(ranked)
+        return
 
     for stock in top_with_atr:
         sym = stock["symbol"]
@@ -1073,26 +1156,31 @@ def run_scan():
         if result is None:
             continue
 
+        # [v35] 진입가는 스냅샷 기준 현재가 (봉 종가 아님)
+        entry_px = result.get("current_price", stock["price"])
+
+        # 매수 제한 체크 (한도 초과면 entry_prices에 남기지 않음)
+        if bought_this_scan >= MAX_BUY_PER_SCAN:
+            print(f"  [매수 제한] {sym} — 이번 스캔 {MAX_BUY_PER_SCAN}종목 초과, 스킵")
+            continue
+
         last_alert[sym] = now_utc
         entry_prices[sym] = {
-            "entry": stock["price"], "time": now_utc,
+            "entry": entry_px, "time": now_utc,
             "alert1": None, "alert2": None, "stop": None,
             "sideways_done": False,
             "thresholds": get_active_thresholds(),   # [v31] 진입 당시 시간대 기준 고정
         }
 
-        # 매수 제한 체크
-        if bought_this_scan >= MAX_BUY_PER_SCAN:
-            print(f"  [매수 제한] {sym} — 이번 스캔 {MAX_BUY_PER_SCAN}종목 초과, 스킵")
-            continue
-
-        bought = sim_open(sym, stock["price"])
+        bought = sim_open(sym, entry_px)
         if bought:
             bought_this_scan += 1
+        else:
+            entry_prices.pop(sym, None)   # 매수 실패 시 추적정보 정리
 
         print(
-            f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
-            f"| 거래량 {result['vol_ratio']:.1f}x | ATR {result['atr']:.3f} | 진입가 ${stock['price']:.2f}"
+            f"[🚀 감지] {sym} | 1분{result['price_change_1m']:+.2f}% | RSI {result['rsi']:.1f} "
+            f"| 거래량 {result['vol_ratio']:.1f}x | 진입가 ${entry_px:.2f}"
         )
         time.sleep(0.5)
 
@@ -1113,7 +1201,7 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v34 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v36 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(
@@ -1127,7 +1215,7 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v34 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v36 시작!</b>\n"
         f"📈 평시 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
         f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
