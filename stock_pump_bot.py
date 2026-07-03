@@ -205,10 +205,47 @@ def get_et_now():
     return datetime.now(ET_TZ)
 
 
+_market_open_cache = {"date": None, "value": False}
+
+def is_market_holiday_or_closed() -> bool:
+    """
+    [v37] Alpaca Clock API로 미국 공휴일/휴장일 여부 확인.
+    같은 날짜에 대해 결과를 캐싱하여 API 호출을 최소화한다.
+    API 호출 실패 시에는 휴장으로 단정하지 않고 False를 반환하여
+    기존 요일 판단 로직만 적용되도록 한다.
+    """
+    now_et = get_et_now()
+    today_str = now_et.strftime("%Y-%m-%d")
+
+    if _market_open_cache["date"] == today_str:
+        return not _market_open_cache["value"]
+
+    try:
+        resp = requests.get(
+            "https://api.alpaca.markets/v2/calendar",
+            headers={
+                "APCA-API-KEY-ID": ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            },
+            params={"start": today_str, "end": today_str},
+            timeout=5,
+        )
+        data = resp.json()
+        is_open_today = len(data) > 0   # 해당 날짜가 캘린더에 있으면 개장일
+        _market_open_cache["date"] = today_str
+        _market_open_cache["value"] = is_open_today
+        return not is_open_today
+    except Exception as e:
+        print(f"[캘린더 조회 오류] {e} → 요일 기준으로만 판단")
+        return False
+
+
 def is_regular_session() -> bool:
     now_et = get_et_now()
     et_min = now_et.hour * 60 + now_et.minute
     if now_et.weekday() >= 5:
+        return False
+    if is_market_holiday_or_closed():
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
 
@@ -218,6 +255,8 @@ def is_aggressive_window() -> bool:
     now_et = get_et_now()
     et_min = now_et.hour * 60 + now_et.minute
     if now_et.weekday() >= 5:
+        return False
+    if is_market_holiday_or_closed():
         return False
     return AGGRESSIVE_START_MIN <= et_min <= AGGRESSIVE_END_MIN
 
@@ -229,6 +268,8 @@ def is_entry_allowed() -> bool:
     now_et = get_et_now()
     et_min = now_et.hour * 60 + now_et.minute
     if now_et.weekday() >= 5:
+        return False
+    if is_market_holiday_or_closed():
         return False
     return et_min >= ENTRY_BLOCK_UNTIL_MIN
 
@@ -912,6 +953,8 @@ def check_scheduled_reports():
     weekday = now_et.weekday()
 
     if weekday >= 5:
+        return
+    if is_market_holiday_or_closed():
         return
 
     # ── 장 종료 최종 일지 (16:00~16:02 ET, 1회) ──
