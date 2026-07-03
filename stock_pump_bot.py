@@ -1220,11 +1220,11 @@ def main():
         f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
         f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
-        f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
+        f"📊 상승률 상위 {REGULAR_TOP_N}종목 → 점수(1분상승×0.7+거래량×0.3) 순 진입\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"⚖️ 1차매도 후 본전스탑 | 💧 분당 거래대금 ${MIN_DOLLAR_VOL_1M//1000}k+ 필수\n"
-        f"🧾 시뮬 체결가 슬리피지 반영 ({SLIPPAGE_NORMAL_PCT}~{SLIPPAGE_LOW_PRICE_PCT}%)\n"
+        f"🧾 시뮬 체결가 슬리피지 반영 ($1미만 5% / $1~3 2% / $3~10 1% / $10+ 0.3%)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
 
