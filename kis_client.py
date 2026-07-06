@@ -32,6 +32,10 @@ TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "TTTT1002U"   # 해외주식 매
 TR_ID_ORDER_SELL = "VTTT1006U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 주문
 TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "TTTS3012R"   # 해외주식 잔고조회
 
+# 미국 주간거래 전용 tr_id (⚠️ 모의투자 지원 여부 및 접두어는 KIS 문서 재확인 필요)
+TR_ID_DAY_BUY  = "TTTS6036U"   # 미국 주간거래 매수
+TR_ID_DAY_SELL = "TTTS6037U"   # 미국 주간거래 매도
+
 _token_cache = {"access_token": None, "expires_at": 0}
 
 
@@ -119,6 +123,47 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
         print(f"[KIS 주문 오류] {symbol} {side} → {result}")
     else:
         print(f"[KIS 주문 성공] {symbol} {side} {qty}주 @ {price} → {result.get('msg1')}")
+
+    return result
+
+
+def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: str = "BAQ") -> dict:
+    """
+    미국 주간거래 전용 주문.
+    ⚠️ 전용 API(TTTS6036U/6037U) + 전용 거래소코드 사용:
+       BAY(뉴욕), BAQ(나스닥), BAA(아멕스) - 종목 상장 거래소에 맞게 지정.
+    ⚠️ 주간거래는 서비스 중단 이력이 있으니 KIS 최신 공지 확인 필요.
+    ⚠️ 모의투자 지원 여부도 KIS 문서로 확인할 것 (미지원일 수 있음).
+    side: "buy" 또는 "sell", ORD_DVSN은 "00"(지정가)만 가능.
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
+
+    tr_id = TR_ID_DAY_BUY if side == "buy" else TR_ID_DAY_SELL
+
+    body = {
+        "CANO": CANO,
+        "ACNT_PRDT_CD": ACNT_PRDT_CD,
+        "OVRS_EXCG_CD": exchange,   # BAY / BAQ / BAA
+        "PDNO": symbol,
+        "ORD_QTY": str(qty),
+        "OVRS_ORD_UNPR": str(price),
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN": "00",   # 지정가만 가능
+    }
+
+    resp = requests.post(
+        f"{BASE_URL}/uapi/overseas-stock/v1/trading/daytime-order",
+        headers=_headers(tr_id),
+        json=body,
+        timeout=10,
+    )
+    result = resp.json()
+
+    if result.get("rt_cd") != "0":
+        print(f"[KIS 주간거래 오류] {symbol} {side} → {result}")
+    else:
+        print(f"[KIS 주간거래 성공] {symbol} {side} {qty}주 @ {price} → {result.get('msg1')}")
 
     return result
 
