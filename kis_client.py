@@ -28,9 +28,9 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443" if USE_MOCK \
     else "https://openapi.koreainvestment.com:9443"
 
 # ── tr_id (⚠️ KIS 최신 문서로 재확인 필수) ──
-TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "JTTT1002U"   # 해외주식 매수 주문
-TR_ID_ORDER_SELL = "VTTT1001U" if USE_MOCK else "JTTT1001U"   # 해외주식 매도 주문
-TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "JTTS3012R"   # 해외주식 잔고조회
+TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "TTTT1002U"   # 해외주식 매수 주문
+TR_ID_ORDER_SELL = "VTTT1006U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 주문
+TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "TTTS3012R"   # 해외주식 잔고조회
 
 _token_cache = {"access_token": None, "expires_at": 0}
 
@@ -78,14 +78,20 @@ def get_exchange_code(symbol: str) -> str:
     return "NASD"   # TODO: 실제 거래소별 매핑 필요
 
 
-def place_order(symbol: str, qty: int, price: float, side: str) -> dict:
+def place_order(symbol: str, qty: int, price: float, side: str, session: str = "regular") -> dict:
     """
     해외주식 주문.
     side: "buy" 또는 "sell"
     price: 지정가 (시장가 주문 시 KIS 정책에 맞는 별도 처리 필요)
+    session: "regular" | "premarket" | "afterhours"
+             ⚠️ premarket/afterhours는 session_utils.py의
+             EXTENDED_HOURS_ORD_DVSN 값을 먼저 채워넣어야 사용 가능합니다.
     """
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
+
+    from session_utils import get_ord_dvsn_for_session
+    ord_dvsn = get_ord_dvsn_for_session(session)
 
     tr_id = TR_ID_ORDER_BUY if side == "buy" else TR_ID_ORDER_SELL
     exchange = get_exchange_code(symbol)
@@ -98,7 +104,7 @@ def place_order(symbol: str, qty: int, price: float, side: str) -> dict:
         "ORD_QTY": str(qty),
         "OVRS_ORD_UNPR": str(price),
         "ORD_SVR_DVSN_CD": "0",
-        "ORD_DVSN": "00",   # 00: 지정가 (시장가 등은 별도 코드 확인 필요)
+        "ORD_DVSN": ord_dvsn,
     }
 
     resp = requests.post(
