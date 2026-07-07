@@ -1,1 +1,1 @@
-worker: python stock_pump_bot.py
+worker: python stock_pump_bot_v30.py
