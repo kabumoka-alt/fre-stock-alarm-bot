@@ -45,6 +45,7 @@ def get_access_token() -> str:
     if _token_cache["access_token"] and now < _token_cache["expires_at"] - 300:
         return _token_cache["access_token"]
 
+    _throttle()
     resp = requests.post(
         f"{BASE_URL}/oauth2/tokenP",
         json={
@@ -71,6 +72,49 @@ def _headers(tr_id: str) -> dict:
         "tr_id": tr_id,
         "custtype": "P",
     }
+
+
+# ── 초당 호출수 제한(Rate Limit) 대응 ──
+# KIS는 계정 등급에 따라 초당 허용 호출 수가 정해져 있어, 짧은 시간에
+# 여러 함수(잔고조회→매수가능조회→주문 등)가 연달아 호출되면 거절될 수 있다.
+_last_request_ts = 0.0
+_MIN_REQUEST_INTERVAL = 0.5   # 최소 호출 간격(초). 계속 걸리면 값을 늘릴 것.
+
+
+def _throttle():
+    """직전 KIS 호출 이후 최소 간격을 보장. 매 요청 직전에 호출."""
+    global _last_request_ts
+    elapsed = time.time() - _last_request_ts
+    if elapsed < _MIN_REQUEST_INTERVAL:
+        time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+    _last_request_ts = time.time()
+
+
+def _is_rate_limited(result: dict) -> bool:
+    msg = str(result.get("msg1", ""))
+    return "초당" in msg or result.get("rt_cd") == "1" and "거래건수" in msg
+
+
+def _request_with_retry(method: str, url: str, retries: int = 3, backoff: float = 1.0, **kwargs) -> dict:
+    """
+    KIS API 호출을 스로틀 + 초당 한도 초과 시 자동 재시도로 감싼 공통 래퍼.
+    method: "get" 또는 "post"
+    """
+    for attempt in range(retries + 1):
+        _throttle()
+        resp = requests.request(method, url, timeout=kwargs.pop("timeout", 10), **kwargs)
+        try:
+            data = resp.json()
+        except ValueError:
+            return {"rt_cd": "-1", "msg1": f"응답 파싱 실패: {resp.text[:200]}"}
+
+        if _is_rate_limited(data) and attempt < retries:
+            wait = backoff * (attempt + 1)
+            print(f"[KIS 호출제한] {wait:.1f}초 대기 후 재시도 ({attempt + 1}/{retries})")
+            time.sleep(wait)
+            continue
+        return data
+    return data
 
 
 def get_exchange_code(symbol: str) -> str:
@@ -111,13 +155,13 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
         "ORD_DVSN": ord_dvsn,
     }
 
-    resp = requests.post(
+    result = _request_with_retry(
+        "post",
         f"{BASE_URL}/uapi/overseas-stock/v1/trading/order",
         headers=_headers(tr_id),
         json=body,
         timeout=10,
     )
-    result = resp.json()
 
     if result.get("rt_cd") != "0":
         print(f"[KIS 주문 오류] {symbol} {side} → {result}")
@@ -152,6 +196,7 @@ def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: st
         "ORD_DVSN": "00",   # 지정가만 가능
     }
 
+    _throttle()
     resp = requests.post(
         f"{BASE_URL}/uapi/overseas-stock/v1/trading/daytime-order",
         headers=_headers(tr_id),
@@ -188,13 +233,13 @@ def get_buyable_amount(symbol: str, price: float) -> float:
         "OVRS_ORD_UNPR": str(price),
     }
     try:
-        resp = requests.get(
+        data = _request_with_retry(
+            "get",
             f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-psamount",
             headers=_headers(TR_ID_BUYABLE),
             params=params,
             timeout=10,
         )
-        data = resp.json()
         if data.get("rt_cd") != "0":
             print(f"[KIS 매수가능금액 조회 오류] {data}")
             return 0.0
@@ -217,6 +262,7 @@ def get_overseas_balance() -> dict:
         "CTX_AREA_FK200": "",
         "CTX_AREA_NK200": "",
     }
+    _throttle()
     resp = requests.get(
         f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance",
         headers=_headers(TR_ID_BALANCE),
@@ -257,6 +303,7 @@ def place_domestic_order(code: str, qty: int, price: int, side: str) -> dict:
         "ORD_QTY": str(qty),
         "ORD_UNPR": str(price),
     }
+    _throttle()
     resp = requests.post(
         f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash",
         headers=_headers(tr_id),
@@ -286,6 +333,7 @@ def get_domestic_balance() -> dict:
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
     }
+    _throttle()
     resp = requests.get(
         f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance",
         headers=_headers(TR_ID_KR_BALANCE),
@@ -311,6 +359,7 @@ def get_domestic_buyable_amount(code: str, price: int) -> float:
         "OVRS_ICLD_YN": "N",
     }
     try:
+        _throttle()
         resp = requests.get(
             f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
             headers=_headers(TR_ID_KR_BUYABLE),
@@ -361,6 +410,7 @@ def get_domestic_ranking(top: int = 30) -> list:
         "FID_INPUT_DATE_1": "",
     }
     try:
+        _throttle()
         resp = requests.get(
             f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
             headers=_headers(TR_ID_KR_RANKING),
@@ -403,6 +453,7 @@ def get_domestic_minute_bars(code: str, count: int = 30) -> list:
         "FID_PW_DATA_INCU_YN": "Y",
     }
     try:
+        _throttle()
         resp = requests.get(
             f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             headers=_headers(TR_ID_KR_MINUTE_BAR),
@@ -437,6 +488,7 @@ def get_domestic_current_price(code: str) -> float:
     """국내주식 현재가 단건 조회. 실패 시 0.0."""
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
     try:
+        _throttle()
         resp = requests.get(
             f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=_headers(TR_ID_KR_CURRENT_PX),
