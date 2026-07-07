@@ -329,6 +329,128 @@ def get_domestic_buyable_amount(code: str, price: int) -> float:
         return 0.0
 
 
+# ══════════════════════════════════════════
+# 국내주식 시세/스크리닝 (시세 API는 tr_id가 모의/실전 구분 없이 동일)
+# ⚠️ 응답 필드명은 실제 실행 결과로 재확인 필요 (아래는 통상 알려진 명칭 기준)
+# ══════════════════════════════════════════
+
+TR_ID_KR_RANKING     = "FHPST01700000"   # 국내주식 등락률 순위
+TR_ID_KR_MINUTE_BAR  = "FHKST03010200"   # 국내주식 당일 분봉 조회
+TR_ID_KR_CURRENT_PX  = "FHKST01010100"   # 국내주식 현재가 시세
+
+
+def get_domestic_ranking(top: int = 30) -> list:
+    """
+    국내주식 등락률 순위 조회 (상승률 상위 top개).
+    반환: [{"code": 종목코드, "name": 종목명, "price": 현재가, "change_pct": 등락률}, ...]
+    ⚠️ 응답 필드명(stck_prpr, prdy_ctrt 등)은 KIS 표준 관례 기준 — 실행 후 확인 필요.
+    """
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",     # J: 코스피+코스닥 통합
+        "FID_COND_SCR_DIV_CODE": "20170",
+        "FID_INPUT_ISCD": "0000",
+        "FID_DIV_CLS_CODE": "0",           # 0: 상승률 순
+        "FID_RANK_SORT_CLS_CODE": "0",
+        "FID_INPUT_CNT_1": "0",
+        "FID_PRC_CLS_CODE": "0",
+        "FID_INPUT_PRICE_1": "",
+        "FID_INPUT_PRICE_2": "",
+        "FID_VOL_CNT": "",
+        "FID_TRGT_CLS_CODE": "0",
+        "FID_TRGT_EXLS_CLS_CODE": "0",
+        "FID_INPUT_DATE_1": "",
+    }
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
+            headers=_headers(TR_ID_KR_RANKING),
+            params=params,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            print(f"[KIS 국내 순위조회 오류] {data}")
+            return []
+        rows = data.get("output", [])[:top]
+        result = []
+        for r in rows:
+            try:
+                result.append({
+                    "code": r.get("stck_shrn_iscd") or r.get("mksc_shrn_iscd"),
+                    "name": r.get("hts_kor_isnm"),
+                    "price": float(r.get("stck_prpr", 0)),
+                    "change_pct": float(r.get("prdy_ctrt", 0)),
+                })
+            except (TypeError, ValueError):
+                continue
+        return result
+    except Exception as e:
+        print(f"[KIS 국내 순위조회 예외] {e}")
+        return []
+
+
+def get_domestic_minute_bars(code: str, count: int = 30) -> list:
+    """
+    국내주식 당일 분봉 조회.
+    반환: Alpaca 봉 형식과 호환되도록 [{"t","o","h","l","c","v"}, ...] (시간순 오름차순)
+    ⚠️ 응답 필드명(stck_cntg_hour, stck_prpr 등) 재확인 필요.
+    """
+    params = {
+        "FID_ETC_CLS_CODE": "",
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": code,
+        "FID_INPUT_HOUR_1": "",
+        "FID_PW_DATA_INCU_YN": "Y",
+    }
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            headers=_headers(TR_ID_KR_MINUTE_BAR),
+            params=params,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            print(f"[KIS 국내 분봉조회 오류] {code} {data}")
+            return []
+        rows = data.get("output2", [])[:count]
+        bars = []
+        for r in reversed(rows):   # KIS는 최신순 반환 → 오름차순으로 뒤집기
+            try:
+                bars.append({
+                    "t": r.get("stck_cntg_hour"),
+                    "o": float(r.get("stck_oprc", 0)),
+                    "h": float(r.get("stck_hgpr", 0)),
+                    "l": float(r.get("stck_lwpr", 0)),
+                    "c": float(r.get("stck_prpr", 0)),
+                    "v": float(r.get("cntg_vol", 0)),
+                })
+            except (TypeError, ValueError):
+                continue
+        return bars
+    except Exception as e:
+        print(f"[KIS 국내 분봉조회 예외] {code} {e}")
+        return []
+
+
+def get_domestic_current_price(code: str) -> float:
+    """국내주식 현재가 단건 조회. 실패 시 0.0."""
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+            headers=_headers(TR_ID_KR_CURRENT_PX),
+            params=params,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            return 0.0
+        return float(data.get("output", {}).get("stck_prpr", 0))
+    except Exception:
+        return 0.0
+
+
 if __name__ == "__main__":
     # 단독 실행 시 토큰 발급 + 해외/국내 잔고 조회 테스트
     print(f"[모드] {'모의투자' if USE_MOCK else '⚠️ 실전투자'}")
@@ -340,4 +462,8 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 잔고 ──")
     print(json.dumps(get_domestic_balance(), indent=2, ensure_ascii=False))
+
+    print("\n── 국내주식 등락률 순위 (상위 5) ──")
+    print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
+
 
