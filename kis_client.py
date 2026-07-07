@@ -29,7 +29,7 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443" if USE_MOCK \
 
 # ── tr_id (⚠️ KIS 최신 문서로 재확인 필수) ──
 TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "TTTT1002U"   # 해외주식 매수 주문
-TR_ID_ORDER_SELL = "VTTT1006U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 주문
+TR_ID_ORDER_SELL = "VTTT1001U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 (⚠️ 모의는 1001U, 실전은 1006U - 비대칭 주의!)
 TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "TTTS3012R"   # 해외주식 잔고조회
 
 # 미국 주간거래 전용 tr_id (⚠️ 모의투자 지원 여부 및 접두어는 KIS 문서 재확인 필요)
@@ -154,6 +154,8 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
         "ORD_SVR_DVSN_CD": "0",
         "ORD_DVSN": ord_dvsn,
     }
+    if side == "sell":
+        body["SLL_TYPE"] = "00"
 
     result = _request_with_retry(
         "post",
