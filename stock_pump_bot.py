@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v37 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v38 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -35,6 +35,12 @@
         · 기존 손절/전량/1차매도/횡보청산보다 우선 체크 (반전 초입에 선제 대응)
         · 목적: 급등주 특유의 "블로우오프 탑 → 급반전" 패턴에서
           손절선(-6~-10%)까지 반납분을 다 태우기 전에 이탈
+- [v38] ★ 집중 투자 + 일일 목표수익 종료 전략 적용
+        · 동시 보유 슬롯: 7개 → 3개 (종목당 배분 자금 확대, 분산 축소)
+        · 당일 실현손익률이 DAILY_PROFIT_TARGET_PCT(6%) 이상 도달하면
+          그날 신규 진입을 전면 중단 (보유 종목 매도/손절/트레일링청산은 계속 정상 작동)
+        · 09:30 ET 장 시작 시점의 예수금/누적손익을 스냅샷하여
+          "오늘 실현손익률"을 별도로 추적 (기존 all-time 누적수익률과 별개)
 """
 
 import os
@@ -49,6 +55,19 @@ ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+
+# ── [KIS 연동] 실주문 스위치 ──
+# "true"일 때만 시뮬레이션과 함께 KIS로 실제(모의투자) 주문을 낸다.
+# 기본값 false → 기존과 동일하게 시뮬레이션만 동작 (안전 기본값).
+LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"
+
+if LIVE_TRADING:
+    import kis_client as kis
+    if not kis.USE_MOCK:
+        raise RuntimeError(
+            "⚠️ KIS_USE_MOCK=false(실전) 상태에서 이 스위치를 켜는 것은 위험합니다. "
+            "모의투자(KIS_USE_MOCK=true)에서 충분히 검증 후 실전 전환하세요."
+        )
 
 # 정규장 조건
 REGULAR_TOP_N        = 30
@@ -97,7 +116,7 @@ PULLBACK_WATCH_MAX      = 10     # 감시 종목 최대 수
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
 MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
-MAX_POSITIONS         = 7    # [v29] 동시 보유 최대 종목 수
+MAX_POSITIONS         = 3    # [v38] 동시 보유 최대 종목 수 (7 → 3, 집중 투자 전략)
 
 # 매도 타이밍 임계값 (평소)
 SELL_PARTIAL_PCT = 7.0
@@ -116,6 +135,9 @@ AGGRESSIVE_STOP_LOSS_PCT    = -6.0   # 손절 타이트하게: -10.0% → -6.0%
 SIDEWAYS_MINUTES = 10
 SIDEWAYS_MIN_PCT = 3.0     # [v20] 횡보 구간 하한
 SIDEWAYS_MAX_PCT = 7.0     # [v20] 횡보 구간 상한 (+3~+7% 이내면 횡보 청산)
+
+# [v38] 일일 목표 수익 도달 시 신규 진입 중단
+DAILY_PROFIT_TARGET_PCT = 6.0   # 당일 누적 수익률(예수금 기준) 이 값(%) 이상이면 그날 신규 진입 중단
 
 HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_API_KEY,
@@ -157,6 +179,11 @@ trade_log: list = []
 # 매시 정각 / 장마감 전송 추적
 last_hourly_report_et: int = -1
 market_close_sent: bool    = False
+
+# [v38] 일일 목표 수익 추적: 하루 시작 시점의 cash/pnl 스냅샷
+day_start_cash: float      = SIM_INITIAL_CASH
+day_start_total_pnl: float = 0.0
+daily_target_hit: bool     = False
 
 
 # ──────────────────────────────────────────
@@ -213,6 +240,32 @@ def send_telegram(message: str):
 def get_et_now():
     # [v34] 서머타임(EDT/EST) 자동 반영
     return datetime.now(ET_TZ)
+
+
+def notify_kis_order(action: str, sym: str, qty: int, price: float, result: dict):
+    """KIS 실주문 결과를 즉시 텔레그램으로 알림 (정기 리포트와 별개로 즉시 전송)."""
+    rt_cd = result.get("rt_cd")
+    msg1  = result.get("msg1", "")
+    if rt_cd == "0":
+        send_telegram(f"✅ [KIS 모의투자] {sym} {action} {qty}주 @ ${price:.2f} 주문 성공\n{msg1}")
+    else:
+        send_telegram(f"⚠️ [KIS 모의투자] {sym} {action} {qty}주 @ ${price:.2f} 주문 실패 (rt_cd={rt_cd})\n{msg1}")
+
+
+def place_kis_order_safe(sym: str, qty: int, price: float, side: str) -> dict:
+    """
+    KIS 주문을 안전하게 호출. 실패해도 예외를 올리지 않고 시뮬레이션 흐름을 막지 않는다.
+    (이 봇은 정규장/공격모드 전용이므로 session="regular" 고정)
+    """
+    try:
+        result = kis.place_order(sym, qty, price, side, session="regular")
+        action = "매수" if side == "buy" else "매도"
+        notify_kis_order(action, sym, qty, price, result)
+        return result
+    except Exception as e:
+        print(f"[KIS 주문 예외] {sym} {side} {qty}주 @ ${price:.2f} → {e}")
+        send_telegram(f"⚠️ [KIS 모의투자] {sym} {side} 주문 중 예외 발생: {e}")
+        return {"rt_cd": "-1", "msg1": str(e)}
 
 
 _market_open_cache = {"date": None, "value": False}
@@ -304,6 +357,42 @@ def get_active_thresholds() -> dict:
 
 
 # ──────────────────────────────────────────
+# [v38] 일일 목표 수익 체크
+# ──────────────────────────────────────────
+
+def today_pnl_pct() -> float:
+    """
+    당일 시작 시점(day_start_cash) 대비 현재까지의 손익률(%).
+    실현손익(청산 완료분)만 반영 — 보유 중 미실현 평가손익은 제외.
+    """
+    if day_start_cash <= 0:
+        return 0.0
+    realized_today = sim_stats["cash"] - day_start_cash
+    # 아직 청산 안 된 보유 포지션의 매입원가는 cash에서 이미 빠져나간 상태이므로
+    # 위 계산은 "현금성 실현손익"이 아니라 "현금 변화량"이 됨.
+    # 좀 더 정확히는 (오늘 실현손익 합계) 기준으로 계산한다.
+    realized_pnl_today = sim_stats["total_pnl"] - day_start_total_pnl
+    return (realized_pnl_today / day_start_cash) * 100
+
+
+def check_daily_target() -> bool:
+    """오늘 누적 실현수익률이 목표(DAILY_PROFIT_TARGET_PCT) 이상이면 True."""
+    global daily_target_hit
+    if daily_target_hit:
+        return True
+    pct = today_pnl_pct()
+    if pct >= DAILY_PROFIT_TARGET_PCT:
+        daily_target_hit = True
+        print(f"[🎯 일일 목표 달성] 오늘 실현손익 {pct:+.2f}% ≥ 목표 {DAILY_PROFIT_TARGET_PCT}% — 신규 진입 중단")
+        send_telegram(
+            f"🎯 <b>일일 목표 수익 달성!</b>\n"
+            f"오늘 실현손익: <b>{pct:+.2f}%</b> (목표 {DAILY_PROFIT_TARGET_PCT}%)\n"
+            f"오늘은 신규 진입을 중단합니다. 보유 종목 매도는 정상 진행됩니다."
+        )
+    return daily_target_hit
+
+
+# ──────────────────────────────────────────
 # 보유 종목 현황 블록
 # ──────────────────────────────────────────
 
@@ -357,6 +446,7 @@ def build_trade_report(title: str) -> str:
         sim_stats["wins"] / sim_stats["trades"] * 100
         if sim_stats["trades"] > 0 else 0.0
     )
+    today_pct = today_pnl_pct()
 
     # [v19] 보유 종목 현재가 조회
     current_prices = {}
@@ -396,11 +486,15 @@ def build_trade_report(title: str) -> str:
     if bl:
         lines.append(bl)
 
+    if daily_target_hit:
+        lines.append(f"🎯 <b>일일 목표({DAILY_PROFIT_TARGET_PCT}%) 달성 — 신규 진입 중단 중</b>")
+
     lines.append("━━━━━━━━━━━━━━")
 
     pnl_sign = "+" if sim_stats["total_pnl"] >= 0 else ""
     lines += [
         f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>",
+        f"📅 오늘 실현손익률: <b>{today_pct:+.2f}%</b> (목표 {DAILY_PROFIT_TARGET_PCT}%)",
         f"💰 누적 손익: <b>{pnl_sign}{sim_stats['total_pnl']:.2f}$</b> "
         f"(<b>{total_return_pct:+.2f}%</b>)",
         f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
@@ -436,6 +530,17 @@ def sim_open(sym: str, price: float) -> bool:
     # [v30] 남은 슬롯에 예수금 균등 분배
     remaining_slots = MAX_POSITIONS - len(sim_positions)
     budget          = sim_stats["cash"] / remaining_slots
+
+    # ── [KIS 연동] 실전 매수가능금액과 비교해서 더 작은 쪽으로 제한 ──
+    # 가상 예수금과 KIS 모의계좌 실제 잔고가 다를 수 있으므로,
+    # 둘 중 작은 금액을 기준으로 수량을 정해 "가상 잔고보다 많이 사는" 상황을 방지.
+    if LIVE_TRADING:
+        real_buyable = kis.get_buyable_amount(sym, fill_price)
+        if real_buyable <= 0:
+            print(f"  [시뮬 매수 불가] {sym} | KIS 매수가능금액 조회 실패 또는 0 — 안전하게 매수 보류")
+            return False
+        budget = min(budget, real_buyable / remaining_slots)
+
     qty             = int(budget // fill_price)
     if qty < 1:
         print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={fill_price:.2f})")
@@ -453,6 +558,11 @@ def sim_open(sym: str, price: float) -> bool:
         "time_kst": now_kst.strftime("%H:%M"),
     })
     print(f"  [시뮬 매수] {sym} {qty}주 @ ${fill_price:.2f} (관측가 ${price:.2f}+슬리피지, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
+
+    # ── [KIS 연동] 실주문(모의투자) 함께 실행 ──
+    if LIVE_TRADING:
+        place_kis_order_safe(sym, qty, fill_price, "buy")
+
     return True
 
 
@@ -509,6 +619,10 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         "time_kst": now_kst.strftime("%H:%M"),
     })
 
+    # ── [KIS 연동] 실주문(모의투자) 함께 실행 ──
+    if LIVE_TRADING:
+        place_kis_order_safe(sym, close_qty, exit_price, "sell")
+
     win_rate         = (
         sim_stats["wins"] / sim_stats["trades"] * 100
         if sim_stats["trades"] > 0 else 0.0
@@ -532,6 +646,10 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         f"{holdings_block()}"
         f"{bl_note}"
     )
+
+    # [v38] 청산 직후 일일 목표 달성 여부 재확인 (매도로 실현손익이 갱신됐으므로)
+    check_daily_target()
+
     return summary
 
 
@@ -1162,6 +1280,12 @@ def run_scan():
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
+    # [v38] 일일 목표 수익 도달 여부 확인 — 도달 시 신규 진입 전면 중단 (매도는 monitor_positions에서 계속)
+    if check_daily_target():
+        print(f"  [🎯 일일 목표 달성] 오늘 신규 진입 중단 (실현 {today_pnl_pct():+.2f}% ≥ 목표 {DAILY_PROFIT_TARGET_PCT}%)")
+        update_pullback_watch(ranked)   # 감시 목록만 갱신, 매수는 하지 않음
+        return
+
     # [v35] 가중 점수(1분상승률×0.7 + 거래량비×0.3)로 재정렬 — 급등 초입 우선
     scored = []
     etf_excluded = []
@@ -1254,10 +1378,11 @@ def run_scan():
 # ──────────────────────────────────────────
 
 def main():
-    global market_close_sent
+    global market_close_sent, day_start_cash, day_start_total_pnl, daily_target_hit
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v37 (정규장 전용 + 시뮬 + 매매일지 + 트레일링청산) 시작!")
+    print("🚀 급등 감지 봇 v38 (정규장 전용 + 시뮬 + 매매일지 + 트레일링청산 + 일일목표종료) 시작!")
+    print(f"🔌 LIVE_TRADING: {'ON (KIS 모의투자 실주문 연동)' if LIVE_TRADING else 'OFF (시뮬레이션만)'}")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(
@@ -1265,22 +1390,25 @@ def main():
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절"
     )
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
-    print(f"🟠 [v37] 트레일링청산: 고점 +{TRAIL_ARM_PCT}% 이상 찍은 뒤 고점 대비 {TRAIL_GIVEBACK_PCT:.0f}% 반납 시 즉시 청산")
-    print(f"⚡ [수정] 보유종목 체크: 전종목 대상, {POSITION_CHECK_INTERVAL}초 주기 (스캔과 완전 분리)")
-    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
+    print(f"🟠 트레일링청산: 고점 +{TRAIL_ARM_PCT}% 이상 찍은 뒤 고점 대비 {TRAIL_GIVEBACK_PCT:.0f}% 반납 시 즉시 청산")
+    print(f"⚡ 보유종목 체크: 전종목 대상, {POSITION_CHECK_INTERVAL}초 주기 (스캔과 완전 분리)")
+    print(f"📦 [v38] 동시 보유 최대 {MAX_POSITIONS}종목 (집중 투자) | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
+    print(f"🎯 [v38] 일일 목표 실현수익 {DAILY_PROFIT_TARGET_PCT}% 도달 시 그날 신규 진입 중단")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v37 (트레일링청산 시뮬) 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v38 (집중투자 + 일일목표종료) 시작!</b>\n"
+        f"🔌 LIVE_TRADING: <b>{'ON (KIS 모의투자 연동)' if LIVE_TRADING else 'OFF (시뮬만)'}</b>\n"
         f"📈 평시 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
         f"🔥 공격모드(09:30~10:30 ET): 1분 {AGGRESSIVE_PRICE_CHANGE_1M}%+ | "
         f"+{AGGRESSIVE_SELL_PARTIAL_PCT}% 1차 | +{AGGRESSIVE_SELL_FULL_PCT}% 전량 | {AGGRESSIVE_STOP_LOSS_PCT}% 손절\n"
-        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
+        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 (집중) | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
+        f"🎯 일일 목표 {DAILY_PROFIT_TARGET_PCT}% 달성 시 그날 신규 진입 중단\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → 점수(1분상승×0.7+거래량×0.3) 순 진입\n"
         f"🟠 트레일링청산: 고점 +{TRAIL_ARM_PCT}% 도달 후 {TRAIL_GIVEBACK_PCT:.0f}% 반납 시 선제 청산\n"
-        f"⚡ [수정] 보유종목 전량 {POSITION_CHECK_INTERVAL}초 주기 체크 (손절 슬리피지 축소)\n"
+        f"⚡ 보유종목 전량 {POSITION_CHECK_INTERVAL}초 주기 체크 (손절 슬리피지 축소)\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"⚖️ 1차매도 후 본전스탑 | 💧 분당 거래대금 ${MIN_DOLLAR_VOL_1M//1000}k+ 필수\n"
@@ -1299,16 +1427,20 @@ def main():
             if market_close_sent:
                 market_close_sent = False
                 print("[리셋] 장마감 플래그 초기화")
-            if blacklisted_today or stop_loss_count or trade_log or last_alert:
+            if blacklisted_today or stop_loss_count or trade_log or last_alert or daily_target_hit:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
                 pullback_watch.clear()   # [v33] 눌림감시 목록도 새 장마다 초기화
                 trade_log.clear()        # [v34] 매매일지 일일 초기화 (무한 누적 방지)
                 last_alert.clear()       # [v34] 쿨다운 기록 초기화
+                # [v38] 일일 목표 추적 기준점 재설정
+                day_start_cash      = sim_stats["cash"]
+                day_start_total_pnl = sim_stats["total_pnl"]
+                daily_target_hit    = False
                 # 포지션 없는 잔여 추적 정보 정리 (장마감 청산 실패 대비)
                 for s in [s for s in entry_prices if s not in sim_positions]:
                     del entry_prices[s]
-                print("[리셋] 블랙리스트/손절카운트/눌림감시/일지/쿨다운 초기화 (새 장 시작)")
+                print("[리셋] 블랙리스트/손절카운트/눌림감시/일지/쿨다운/일일목표 초기화 (새 장 시작)")
 
         check_scheduled_reports()
 
