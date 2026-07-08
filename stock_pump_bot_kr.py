@@ -122,6 +122,16 @@ def notify_kis_order(action: str, code: str, qty: int, price: int, result: dict)
 
 def place_kis_order_safe(code: str, qty: int, price: int, side: str):
     try:
+        # ── 매도 가드: 실제 잔고 확인 (유령 포지션 방지) ──
+        if side == "sell":
+            _sellable = kis.get_kr_sellable_qty(code)
+            if _sellable <= 0:
+                print(f"  [매도 스킵] {code} 실잔고 0주 (장부 불일치)")
+                sim_positions.pop(code, None)
+                return {"rt_cd": "-1", "msg1": "실잔고 없음 - 매도 스킵"}
+            if qty > _sellable:
+                print(f"  [매도 수량 축소] {code} {qty}주 → {_sellable}주 (실잔고)")
+                qty = _sellable
         result = kis.place_domestic_order(code, qty, price, side)
         notify_kis_order("매수" if side == "buy" else "매도", code, qty, price, result)
         return result
@@ -396,37 +406,42 @@ def main():
 
     last_scan_time = 0.0
     while True:
-        now_str = get_kst_now().strftime("%H:%M:%S")
+        try:
+            now_str = get_kst_now().strftime("%H:%M:%S")
 
-        if get_kst_now().hour == 9 and get_kst_now().minute == 0:
-            if blacklisted_today or stop_loss_count or trade_log or last_alert:
-                blacklisted_today.clear(); stop_loss_count.clear()
-                trade_log.clear(); last_alert.clear()
-                market_close_sent = False
+            if get_kst_now().hour == 9 and get_kst_now().minute == 0:
+                if blacklisted_today or stop_loss_count or trade_log or last_alert:
+                    blacklisted_today.clear(); stop_loss_count.clear()
+                    trade_log.clear(); last_alert.clear()
+                    market_close_sent = False
 
-        if not is_krx_regular_session():
-            print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
+            if not is_krx_regular_session():
+                print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
+                time.sleep(POSITION_CHECK_INTERVAL)
+                continue
+
+            if get_kst_now().hour == 15 and get_kst_now().minute >= 30 and not market_close_sent:
+                market_close_sent = True
+                for code in list(sim_positions.keys()):
+                    price = kis.get_domestic_current_price(code)
+                    if price:
+                        sim_close(code, price, "장마감 강제청산")
+                send_telegram(build_report("🔔 장 종료 최종 매매일지"))
+
+            monitor_positions()
+
+            now_mono = time.monotonic()
+            if now_mono - last_scan_time >= CHECK_INTERVAL:
+                last_scan_time = now_mono
+                print(f"\n[{now_str}] 정규장 스캔 시작")
+                run_scan()
+
             time.sleep(POSITION_CHECK_INTERVAL)
-            continue
-
-        if get_kst_now().hour == 15 and get_kst_now().minute >= 30 and not market_close_sent:
-            market_close_sent = True
-            for code in list(sim_positions.keys()):
-                price = kis.get_domestic_current_price(code)
-                if price:
-                    sim_close(code, price, "장마감 강제청산")
-            send_telegram(build_report("🔔 장 종료 최종 매매일지"))
-
-        monitor_positions()
-
-        now_mono = time.monotonic()
-        if now_mono - last_scan_time >= CHECK_INTERVAL:
-            last_scan_time = now_mono
-            print(f"\n[{now_str}] 정규장 스캔 시작")
-            run_scan()
-
-        time.sleep(POSITION_CHECK_INTERVAL)
 
 
+        except Exception as _loop_e:
+            print(f"[\ub8e8\ud504 \uc624\ub958] {_loop_e}")
+            import traceback; traceback.print_exc()
+            time.sleep(POSITION_CHECK_INTERVAL)
 if __name__ == "__main__":
     main()
