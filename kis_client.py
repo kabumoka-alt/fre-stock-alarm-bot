@@ -78,7 +78,7 @@ def _headers(tr_id: str) -> dict:
 # KIS는 계정 등급에 따라 초당 허용 호출 수가 정해져 있어, 짧은 시간에
 # 여러 함수(잔고조회→매수가능조회→주문 등)가 연달아 호출되면 거절될 수 있다.
 _last_request_ts = 0.0
-_MIN_REQUEST_INTERVAL = 0.5   # 최소 호출 간격(초). 계속 걸리면 값을 늘릴 것.
+_MIN_REQUEST_INTERVAL = 1.0   # 최소 호출 간격(초). 계속 걸리면 값을 늘릴 것.
 
 
 def _throttle():
@@ -410,6 +410,8 @@ def get_domestic_ranking(top: int = 30) -> list:
         "FID_TRGT_CLS_CODE": "0",
         "FID_TRGT_EXLS_CLS_CODE": "0",
         "FID_INPUT_DATE_1": "",
+        "FID_RSFL_RATE1": "",
+        "FID_RSFL_RATE2": "",
     }
     try:
         _throttle()

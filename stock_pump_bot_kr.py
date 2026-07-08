@@ -348,6 +348,29 @@ def build_report(title: str) -> str:
     else:
         lines.append("거래 내역 없음")
     lines.append("━━━━━━━━━━━━━━")
+    # ── 종목별 요약 (청산 거래만) ──
+    _closed = [t for t in daily_trades if t.get("reason") != "매수"]
+    if _closed:
+        _by = {}
+        for t in _closed:
+            s = _by.setdefault(t["sym"], {"pnl": 0.0, "n": 0})
+            s["pnl"] += t.get("pnl", 0.0); s["n"] += 1
+        lines.append("📊 <b>종목별 요약</b>")
+        for sym, s in sorted(_by.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
+            ic = "🔴" if s["pnl"] > 0 else ("🔵" if s["pnl"] < 0 else "⚪")
+            lines.append(f"  {ic} {sym}: {s['pnl']:+,.0f}원 ({s['n']}건)")
+        _best = max(_closed, key=lambda t: t.get("pnl", 0.0))
+        _worst = min(_closed, key=lambda t: t.get("pnl", 0.0))
+        lines.append(f"  🏆 베스트: {_best['sym']} {_best.get('pnl',0):+,.0f}원")
+        lines.append(f"  📉 워스트: {_worst['sym']} {_worst.get('pnl',0):+,.0f}원")
+        _w = [t["pnl"] for t in _closed if t.get("pnl",0) > 0]
+        _l = [t["pnl"] for t in _closed if t.get("pnl",0) < 0]
+        if _w and _l:
+            aw = sum(_w)/len(_w); al = abs(sum(_l)/len(_l))
+            if al > 0:
+                lines.append(f"  ⚖️ 손익비: {aw/al:.2f} (평균익 {aw:+,.0f}원 / 평균손 -{al:,.0f}원)")
+        lines.append("━" * 14)
+
     lines.append(f"💵 예수금: {sim_stats['cash']:,.0f}원")
     lines.append(f"💰 누적손익: {sim_stats['total_pnl']:+,.0f}원 ({total_return:+.2f}%)")
     lines.append(f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 (승률 {win_rate:.0f}%)")

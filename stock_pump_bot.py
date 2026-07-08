@@ -491,6 +491,29 @@ def build_trade_report(title: str) -> str:
 
     lines.append("━━━━━━━━━━━━━━")
 
+    # ── 종목별 요약 (청산 거래만) ──
+    _closed = [t for t in daily_trades if t.get("reason") != "매수"]
+    if _closed:
+        _by = {}
+        for t in _closed:
+            s = _by.setdefault(t["sym"], {"pnl": 0.0, "n": 0})
+            s["pnl"] += t.get("pnl", 0.0); s["n"] += 1
+        lines.append("📊 <b>종목별 요약</b>")
+        for sym, s in sorted(_by.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
+            ic = "🔴" if s["pnl"] > 0 else ("🔵" if s["pnl"] < 0 else "⚪")
+            lines.append(f"  {ic} {sym}: {s['pnl']:+.2f}$ ({s['n']}건)")
+        _best = max(_closed, key=lambda t: t.get("pnl", 0.0))
+        _worst = min(_closed, key=lambda t: t.get("pnl", 0.0))
+        lines.append(f"  🏆 베스트: {_best['sym']} {_best.get('pnl',0):+.2f}$")
+        lines.append(f"  📉 워스트: {_worst['sym']} {_worst.get('pnl',0):+.2f}$")
+        _w = [t["pnl"] for t in _closed if t.get("pnl",0) > 0]
+        _l = [t["pnl"] for t in _closed if t.get("pnl",0) < 0]
+        if _w and _l:
+            aw = sum(_w)/len(_w); al = abs(sum(_l)/len(_l))
+            if al > 0:
+                lines.append(f"  ⚖️ 손익비: {aw/al:.2f} (평균익 {aw:+.2f}$ / 평균손 -{al:.2f}$)")
+        lines.append("━" * 14)
+
     pnl_sign = "+" if sim_stats["total_pnl"] >= 0 else ""
     lines += [
         f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>",
