@@ -387,6 +387,31 @@ def build_report(title: str) -> str:
     return "\n".join(lines)
 
 
+def restore_positions_from_account():
+    """봇 시작 시 실계좌 잔고를 읽어 감시 대상(entry_prices/sim_positions) 복원."""
+    try:
+        bal = kis.get_domestic_balance()
+    except Exception as e:
+        print(f"[포지션 복원 실패] {e}")
+        return
+    restored = 0
+    for h in bal.get("output1", []):
+        code = h.get("pdno")
+        qty = int(h.get("hldg_qty", 0) or 0)
+        avg = float(h.get("pchs_avg_pric", 0) or 0)
+        name = h.get("prdt_name", "")
+        if not code or qty <= 0 or avg <= 0:
+            continue
+        if code in entry_prices:
+            continue
+        entry_prices[code] = {"entry": avg, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
+        sim_positions[code] = {"entry": avg, "qty": qty, "partial_done": False, "name": name}
+        restored += 1
+    if restored:
+        print(f"[포지션 복원] 실계좌 {restored}종목 감시 등록 완료")
+        send_telegram(f"🔄 [국장] 실계좌 {restored}종목 감시 복원 완료 (손절/익절 감시 시작)")
+
+
 def main():
     global market_close_sent
     print("=" * 60)
@@ -405,6 +430,8 @@ def main():
     )
 
     last_scan_time = 0.0
+    restore_positions_from_account()
+
     while True:
         try:
             now_str = get_kst_now().strftime("%H:%M:%S")
