@@ -385,6 +385,27 @@ def get_domestic_balance() -> dict:
     return resp.json()
 
 
+def get_kr_sellable_qty(code: str) -> int:
+    """
+    국내주식 특정 종목의 매도가능수량 조회.
+    잔고조회(output1)에서 해당 종목을 찾아 주문가능수량(ord_psbl_qty)을 반환.
+    ord_psbl_qty가 없으면 보유수량(hldg_qty)으로 대체. 조회 실패/미보유 시 0.
+    """
+    try:
+        bal = get_domestic_balance()
+    except Exception as e:
+        print(f"[KIS 매도가능수량 조회 예외] {code} {e}")
+        return 0
+    for h in bal.get("output1", []):
+        if h.get("pdno") == code:
+            qty = h.get("ord_psbl_qty") or h.get("hldg_qty") or 0
+            try:
+                return int(float(qty))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def get_domestic_buyable_amount(code: str, price: int) -> float:
     """
     국내주식 매수가능금액 조회.
