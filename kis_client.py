@@ -450,8 +450,8 @@ def get_domestic_ranking(top: int = 30) -> list:
         "FID_TRGT_CLS_CODE": "0",
         "FID_TRGT_EXLS_CLS_CODE": "0",
         "FID_INPUT_DATE_1": "",
-        "FID_RSFL_RATE1": "",   # [버그수정] 등락비율 하한 - 누락 시 OPSQ20001 오류로 조회 전체 실패
-        "FID_RSFL_RATE2": "",   # 등락비율 상한
+        "FID_RSFL_RATE1": "0",    # 등락비율 하한(%) - 빈 문자열이면 필드 인식 실패 → "0"
+        "FID_RSFL_RATE2": "30",   # 등락비율 상한(%) - 상한가(약 30%)까지 포함
     }
     try:
         _throttle()
@@ -463,7 +463,8 @@ def get_domestic_ranking(top: int = 30) -> list:
         )
         data = resp.json()
         if data.get("rt_cd") != "0":
-            print(f"[KIS 국내 순위조회 오류] {data}")
+            print(f"[KIS 국내 순위조회 오류] rt_cd={data.get('rt_cd')} msg_cd={data.get('msg_cd')} msg1={data.get('msg1')}")
+            print(f"[KIS 국내 순위조회 오류 전체응답] {data}")
             return []
         rows = data.get("output", [])[:top]
         result = []
@@ -561,3 +562,5 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 등락률 순위 (상위 5) ──")
     print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
+
+
