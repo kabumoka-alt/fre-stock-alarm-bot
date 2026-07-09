@@ -561,5 +561,3 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 등락률 순위 (상위 5) ──")
     print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
-
-
