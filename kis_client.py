@@ -1,563 +1,689 @@
 """
-한국투자증권(KIS) Open API 연동 모듈
-────────────────────────────────────
-⚠️ 반드시 모의투자(MOCK)로 먼저 충분히 검증 후 실전 전환할 것.
-⚠️ tr_id 값은 KIS 개발자센터 최신 문서로 재확인 필요 (API 개편 시 변경될 수 있음).
+국내주식(KRX) 급등 감지 봇 (모의투자 연동)
+──────────────────────────────────────────
+스크리닝/시세는 KIS API, 시뮬레이션+실주문(모의투자)도 KIS로 처리.
 
-필요 환경변수:
-  KIS_APP_KEY       - 발급받은 앱키
-  KIS_APP_SECRET    - 발급받은 앱시크릿
-  KIS_ACCOUNT_NO    - 계좌번호 전체 (예: 12345678-01)
-  KIS_USE_MOCK      - "true"면 모의투자 서버 사용, "false"면 실전 서버 (기본: true)
+- 정규장(09:00~15:30 KST)만 스캔
+- [v2] 1분봉 3%+ 는 1차 필터, 통과 종목은 가중점수(1분변화율×0.5 + 거래량서지×0.3
+  + RSI보너스×0.2)로 재정렬해 상위 종목만 매수 (해외주식봇 v35 스코어링 방식 이식)
+- [v2] 국내장 전용 안전필터: 상한가(전일대비 +29%↑) 근접 종목 제외, 우선주 이름 패턴 제외
+- [v3] 예산 로직 안정화: LIVE_TRADING 시 가상 캐시(sim_stats) 대신 실계좌 매수가능금액
+  기준으로 슬롯당 예산 산정
+  → 재시작 후 포지션 복원 시 가상 캐시와 실잔고가 어긋나 발생했던 대량 오매수 방지
+- [v4] 당일 매수·당일 매도 원칙: 14:50 이후 신규 매수 중단, 15:15(동시호가 15:20 전)에
+  보유종목 전량 정리매매 완료. 예수금은 실계좌 기준이라 봇 재시작과 무관하게 자동으로
+  누적(복리)됨.
+- [v5] 풀매수 = 예수금 전액 사용(3슬롯 분산, 한 종목 몰빵 아님). 총상한 캡 제거 —
+  매수가능금액 전액을 MAX_POSITIONS로 나눠 슬롯 예산 산정.
+- [v6] 하루 누적 실현손익이 기준자본 대비 +6%(DAILY_PROFIT_TARGET_PCT)에 도달하면
+  그날 신규 매수만 중단(보유종목 매도/손절 감시는 계속). 기준자본은 매일 9:00에
+  실계좌 예수금으로 갱신.
+- [v7] 익절폭 > 손절폭 구조로 전환: 손절 -2%(net), 순수익 +2.5% 도달 시 트레일링 스탑
+  활성화되어 고점 대비 -1.5%p 되밀리면 청산, +8%(net) 도달 시 트레일링 없이 즉시 확정.
+  모든 손익 판단은 수수료·세금(왕복 약 0.24%)까지 반영한 순수익률 기준(net_gain_pct).
+  분할매도 없음(전량 진입/전량 청산).
+- 보유종목 10초 주기 체크 (해외주식봇과 동일한 슬리피지 개선 적용)
+- 손절 2회 도달 시 당일 블랙리스트
+
+⚠️ 국내 공휴일(설/추석 등) 캘린더 체크는 아직 없음 — 요일만 판단.
+   필요 시 한국거래소 휴장일 API나 고정 리스트 추가 필요.
+⚠️ KIS 시세 API 응답 필드명은 실제 실행 결과로 재확인 필요.
 """
 
 import os
+import re
 import time
-import json
 import requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-KIS_APP_KEY    = os.environ["KIS_APP_KEY"]
-KIS_APP_SECRET = os.environ["KIS_APP_SECRET"]
-KIS_ACCOUNT_NO = os.environ["KIS_ACCOUNT_NO"]   # "12345678-01" 형태
-USE_MOCK       = os.environ.get("KIS_USE_MOCK", "true").lower() == "true"
+import kis_client as kis
 
-CANO         = KIS_ACCOUNT_NO.split("-")[0]          # 계좌번호 앞 8자리
-ACNT_PRDT_CD = KIS_ACCOUNT_NO.split("-")[1]           # 상품코드 뒤 2자리
+KST = ZoneInfo("Asia/Seoul")
 
-BASE_URL = "https://openapivts.koreainvestment.com:29443" if USE_MOCK \
-    else "https://openapi.koreainvestment.com:9443"
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
-# ── tr_id (⚠️ KIS 최신 문서로 재확인 필수) ──
-TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "TTTT1002U"   # 해외주식 매수 주문
-TR_ID_ORDER_SELL = "VTTT1006U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 주문
-TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "TTTS3012R"   # 해외주식 잔고조회
+# ── LIVE_TRADING: true일 때만 KIS 모의투자 실주문 함께 실행 ──
+LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"
+if LIVE_TRADING and not kis.USE_MOCK:
+    raise RuntimeError("⚠️ KIS_USE_MOCK=false 상태에서 이 스위치를 켜는 것은 위험합니다.")
 
-# 미국 주간거래 전용 tr_id (⚠️ 모의투자 지원 여부 및 접두어는 KIS 문서 재확인 필요)
-TR_ID_DAY_BUY  = "TTTS6036U"   # 미국 주간거래 매수
-TR_ID_DAY_SELL = "TTTS6037U"   # 미국 주간거래 매도
+# ── 조건 (해외주식봇과 동일) ──
+TOP_N               = 30
+PRICE_CHANGE_1M      = 3.0
+MIN_PRICE            = 1000      # 국내주식 저가주 필터 (원)
+CHECK_INTERVAL        = 60
+POSITION_CHECK_INTERVAL = 10
+COOLDOWN_MINUTES      = 30
+SELL_COOLDOWN_MINUTES = 60
+MAX_BUY_PER_SCAN      = 3
+MAX_POSITIONS         = 3        # v38 집중투자 기준
 
-_token_cache = {"access_token": None, "expires_at": 0}
+# [v2] 스코어링 도입
+MIN_ENTRY_SCORE   = 6.0     # 가중점수 10점 만점 중 최소 통과선 (아래 calc_entry_score 참고)
+LIMIT_UP_THRESHOLD = 29.0   # 전일대비 등락률(%) 이 값 이상이면 상한가 근접으로 보고 제외
 
+# [v7] 익절폭 > 손절폭 구조로 전환 + 트레일링 스탑
+#      (등락률 상위를 쫓는 모멘텀 전략은 승률이 낮게 나오기 쉬워서, 손익비를 반대로
+#       가져가야 승률 40% 안팎에서도 기대값이 플러스가 됨 — 계산 근거는 아래 주석 참고)
+STOP_LOSS_PCT       = -2.0   # [v7] -3.0 → -2.0, 손절폭을 좁혀서 손익비 개선
+TRAIL_ACTIVATE_PCT  = 2.5    # 순수익(수수료 반영) 이 값 이상 찍으면 트레일링 스탑 활성화
+TRAIL_GAP_PCT        = 1.5    # 활성화 후 고점 대비 이만큼(%p) 되밀리면 청산 (수익 보존)
+SELL_FULL_PCT       = 8.0    # 안전판 하드 상한 — 여기 도달하면 트레일링 기다리지 않고 즉시 확정
+# 손익분기 승률(수수료 반영 전 근사) = 손절/(익절+손절) = 2/(TRAIL_GAP 기준이라 상황별이지만)
+# 대략 2/(4+2)=33% 안팎 → 모멘텀 전략치고 넉넉한 마진
 
-def get_access_token() -> str:
-    """접근토큰 발급/캐싱. 만료 5분 전에 자동 갱신."""
-    now = time.time()
-    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 300:
-        return _token_cache["access_token"]
+MAX_STOP_LOSS_COUNT = 2
 
-    _throttle()
-    resp = requests.post(
-        f"{BASE_URL}/oauth2/tokenP",
-        json={
-            "grant_type": "client_credentials",
-            "appkey": KIS_APP_KEY,
-            "appsecret": KIS_APP_SECRET,
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    _token_cache["access_token"] = data["access_token"]
-    _token_cache["expires_at"] = now + int(data.get("expires_in", 86400))
-    print(f"[KIS] 토큰 발급 완료 (만료: {data.get('expires_in')}초 후)")
-    return _token_cache["access_token"]
-
-
-def _headers(tr_id: str) -> dict:
-    return {
-        "content-type": "application/json; charset=utf-8",
-        "authorization": f"Bearer {get_access_token()}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
-        "tr_id": tr_id,
-        "custtype": "P",
-    }
+# [v7] 수수료·세금 반영 (2026.1.1~ 세율 기준, 실제 요율은 증권사 등급/이벤트에 따라 다를 수 있음)
+#      매도 시 증권거래세 0.20%(코스피 0.05%+농특세 0.15% / 코스닥 0.20%, 동일 총율)
+#      + 매수/매도 수수료(온라인 기준 약 0.015%씩) + 유관기관제비용(약 0.0037%씩)
+BUY_COST_RATE_PCT  = 0.015 + 0.0037          # 매수 시 비용률(%): 수수료 + 유관기관제비용
+SELL_COST_RATE_PCT = 0.015 + 0.20 + 0.0037   # 매도 시 비용률(%): 수수료 + 거래세 + 유관기관제비용
 
 
-# ── 초당 호출수 제한(Rate Limit) 대응 ──
-# KIS는 계정 등급에 따라 초당 허용 호출 수가 정해져 있어, 짧은 시간에
-# 여러 함수(잔고조회→매수가능조회→주문 등)가 연달아 호출되면 거절될 수 있다.
-_last_request_ts = 0.0
-_MIN_REQUEST_INTERVAL = 0.5   # 최소 호출 간격(초). 계속 걸리면 값을 늘릴 것.
+def net_entry_cost(price: float) -> float:
+    """매수 1주당 실제 지불금액(수수료 포함)."""
+    return price * (1 + BUY_COST_RATE_PCT / 100)
 
 
-def _throttle():
-    """직전 KIS 호출 이후 최소 간격을 보장. 매 요청 직전에 호출."""
-    global _last_request_ts
-    elapsed = time.time() - _last_request_ts
-    if elapsed < _MIN_REQUEST_INTERVAL:
-        time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
-    _last_request_ts = time.time()
+def net_exit_proceeds(price: float) -> float:
+    """매도 1주당 실제 수령금액(수수료·세금 차감)."""
+    return price * (1 - SELL_COST_RATE_PCT / 100)
 
 
-def _is_rate_limited(result: dict) -> bool:
-    msg = str(result.get("msg1", ""))
-    return "초당" in msg or result.get("rt_cd") == "1" and "거래건수" in msg
-
-
-def _request_with_retry(method: str, url: str, retries: int = 3, backoff: float = 1.0, **kwargs) -> dict:
-    """
-    KIS API 호출을 스로틀 + 초당 한도 초과 시 자동 재시도로 감싼 공통 래퍼.
-    method: "get" 또는 "post"
-    """
-    for attempt in range(retries + 1):
-        _throttle()
-        resp = requests.request(method, url, timeout=kwargs.pop("timeout", 10), **kwargs)
-        try:
-            data = resp.json()
-        except ValueError:
-            return {"rt_cd": "-1", "msg1": f"응답 파싱 실패: {resp.text[:200]}"}
-
-        if _is_rate_limited(data) and attempt < retries:
-            wait = backoff * (attempt + 1)
-            print(f"[KIS 호출제한] {wait:.1f}초 대기 후 재시도 ({attempt + 1}/{retries})")
-            time.sleep(wait)
-            continue
-        return data
-    return data
-
-
-def get_exchange_code(symbol: str) -> str:
-    """
-    종목의 해외거래소코드 반환.
-    ⚠️ 간단화를 위해 기본값만 처리. 정확한 매핑은 Alpaca 자산 정보(exchange)를
-    조회해서 NASDAQ→NASD, NYSE→NYSE, AMEX→AMEX 로 변환하는 로직을 추가할 것.
-    """
-    return "NASD"   # TODO: 실제 거래소별 매핑 필요
-
-
-def place_order(symbol: str, qty: int, price: float, side: str, session: str = "regular") -> dict:
-    """
-    해외주식 주문.
-    side: "buy" 또는 "sell"
-    price: 지정가 (시장가 주문 시 KIS 정책에 맞는 별도 처리 필요)
-    session: "regular" | "premarket" | "afterhours"
-             ⚠️ premarket/afterhours는 session_utils.py의
-             EXTENDED_HOURS_ORD_DVSN 값을 먼저 채워넣어야 사용 가능합니다.
-    """
-    if side not in ("buy", "sell"):
-        raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
-
-    from session_utils import get_ord_dvsn_for_session
-    ord_dvsn = get_ord_dvsn_for_session(session)
-
-    tr_id = TR_ID_ORDER_BUY if side == "buy" else TR_ID_ORDER_SELL
-    exchange = get_exchange_code(symbol)
-
-    body = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": exchange,
-        "PDNO": symbol,
-        "ORD_QTY": str(qty),
-        "OVRS_ORD_UNPR": str(price),
-        "ORD_SVR_DVSN_CD": "0",
-        "ORD_DVSN": ord_dvsn,
-    }
-
-    result = _request_with_retry(
-        "post",
-        f"{BASE_URL}/uapi/overseas-stock/v1/trading/order",
-        headers=_headers(tr_id),
-        json=body,
-        timeout=10,
-    )
-
-    if result.get("rt_cd") != "0":
-        print(f"[KIS 주문 오류] {symbol} {side} → {result}")
-    else:
-        print(f"[KIS 주문 성공] {symbol} {side} {qty}주 @ {price} → {result.get('msg1')}")
-
-    return result
-
-
-def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: str = "BAQ") -> dict:
-    """
-    미국 주간거래 전용 주문.
-    ⚠️ 전용 API(TTTS6036U/6037U) + 전용 거래소코드 사용:
-       BAY(뉴욕), BAQ(나스닥), BAA(아멕스) - 종목 상장 거래소에 맞게 지정.
-    ⚠️ 주간거래는 서비스 중단 이력이 있으니 KIS 최신 공지 확인 필요.
-    ⚠️ 모의투자 지원 여부도 KIS 문서로 확인할 것 (미지원일 수 있음).
-    side: "buy" 또는 "sell", ORD_DVSN은 "00"(지정가)만 가능.
-    """
-    if side not in ("buy", "sell"):
-        raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
-
-    tr_id = TR_ID_DAY_BUY if side == "buy" else TR_ID_DAY_SELL
-
-    body = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": exchange,   # BAY / BAQ / BAA
-        "PDNO": symbol,
-        "ORD_QTY": str(qty),
-        "OVRS_ORD_UNPR": str(price),
-        "ORD_SVR_DVSN_CD": "0",
-        "ORD_DVSN": "00",   # 지정가만 가능
-    }
-
-    _throttle()
-    resp = requests.post(
-        f"{BASE_URL}/uapi/overseas-stock/v1/trading/daytime-order",
-        headers=_headers(tr_id),
-        json=body,
-        timeout=10,
-    )
-    result = resp.json()
-
-    if result.get("rt_cd") != "0":
-        print(f"[KIS 주간거래 오류] {symbol} {side} → {result}")
-    else:
-        print(f"[KIS 주간거래 성공] {symbol} {side} {qty}주 @ {price} → {result.get('msg1')}")
-
-    return result
-
-
-# 매수가능금액조회 tr_id (⚠️ 파라미터/필드명 KIS 최신 문서로 재확인 권장)
-TR_ID_BUYABLE = "VTTS3007R" if USE_MOCK else "TTTS3007R"
-
-
-def get_buyable_amount(symbol: str, price: float) -> float:
-    """
-    해외주식 매수가능금액 조회.
-    ⚠️ tr_id/응답 필드명은 확인이 완전하지 않으니, 실사용 전 KIS 개발자센터
-       문서나 챗봇으로 "해외주식 매수가능금액조회" API를 재확인할 것.
-    실패 시 0.0을 반환하여 상위 로직이 안전하게(매수 안 함) 처리하도록 함.
-    """
-    exchange = get_exchange_code(symbol)
-    params = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": exchange,
-        "ITEM_CD": symbol,
-        "OVRS_ORD_UNPR": str(price),
-    }
-    try:
-        data = _request_with_retry(
-            "get",
-            f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-psamount",
-            headers=_headers(TR_ID_BUYABLE),
-            params=params,
-            timeout=10,
-        )
-        if data.get("rt_cd") != "0":
-            print(f"[KIS 매수가능금액 조회 오류] {data}")
-            return 0.0
-        output = data.get("output", {})
-        # ⚠️ 필드명 추정치: 실제 응답 구조 확인 후 정확한 키로 교체 필요
-        amt = output.get("ord_psbl_frcr_amt") or output.get("frcr_ord_psbl_amt1") or 0
-        return float(amt)
-    except Exception as e:
-        print(f"[KIS 매수가능금액 예외] {e}")
+def net_gain_pct(entry_price: float, current_price: float) -> float:
+    """수수료·세금까지 반영한 순수익률(%). 매도 타이밍 판단은 전부 이 값 기준."""
+    cost = net_entry_cost(entry_price)
+    proceeds = net_exit_proceeds(current_price)
+    if cost <= 0:
         return 0.0
+    return (proceeds - cost) / cost * 100
+
+# [v6] 종목당 익절과는 별개로, 하루 누적 수익률이 이 값에 도달하면 그날 신규 매수만 중단
+#      (보유종목 감시/매도는 계속 정상 진행). 해외봇의 "일일 수익목표 도달 시 halt"와 동일 개념.
+DAILY_PROFIT_TARGET_PCT = 6.0
+
+SIM_INITIAL_CASH = 1_000_000   # 원 단위 가상 예수금 (LIVE_TRADING=false 순수 시뮬레이션 전용)
+
+# [v3] 예산 로직 안정화: LIVE_TRADING일 때는 가상 캐시 대신 실계좌 매수가능금액을 기준으로 사용
+# [v5] 총상한 캡 제거 — 예수금(매수가능금액) 전액을 MAX_POSITIONS(3) 슬롯으로 나눠서 씀.
+#      (한 종목 몰빵이 아니라 "현금을 놀리지 않는다"는 의미의 풀매수)
+
+# [v4] 당일 매수·당일 매도 원칙 + 동시호가(15:20~) 이전 정리매매
+BUY_CUTOFF_HOUR, BUY_CUTOFF_MINUTE   = 14, 50   # 이 시각 이후 신규 매수(스캔) 중단 → 청산 전 정리 시간 확보
+LIQUIDATION_HOUR, LIQUIDATION_MINUTE = 15, 15   # 동시호가 시작(15:20) 전, 연속거래 중에 전량 청산 완료
+
+entry_prices: dict = {}
+last_alert: dict = {}
+sim_positions: dict = {}
+sim_stats = {
+    "initial_cash": SIM_INITIAL_CASH,
+    "cash": SIM_INITIAL_CASH,
+    "total_pnl": 0.0,
+    "trades": 0, "wins": 0, "losses": 0,
+}
+stop_loss_count: dict = {}
+blacklisted_today: set = set()
+trade_log: list = []
+last_hourly_report: int = -1
+market_close_sent = False
+
+# [v6] 일일 누적 수익목표 추적 (매일 9:00에 리셋)
+daily_start_balance: float = 0.0   # 그날 시작 시점 실계좌 예수금 (기준 자본)
+daily_realized_pnl: float = 0.0    # 그날 실현손익 누적
+daily_target_hit: bool = False     # 목표 도달 시 True → 신규 매수 중단
 
 
-def get_overseas_balance() -> dict:
-    """해외주식 잔고 조회."""
-    params = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": "NASD",
-        "TR_CRCY_CD": "USD",
-        "CTX_AREA_FK200": "",
-        "CTX_AREA_NK200": "",
-    }
-    _throttle()
-    resp = requests.get(
-        f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance",
-        headers=_headers(TR_ID_BALANCE),
-        params=params,
-        timeout=10,
-    )
-    return resp.json()
+# ──────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────
+
+def get_kst_now():
+    return datetime.now(KST)
 
 
-# ══════════════════════════════════════════
-# 국내주식 (KRX) — 해외주식과 tr_id/파라미터가 다름
-# ⚠️ 아래 tr_id는 국내주식 API에서 널리 알려진 값이지만,
-#    KIS 개발자센터 최신 문서로 한 번은 재확인 권장.
-# ══════════════════════════════════════════
-
-TR_ID_KR_ORDER_BUY  = "VTTC0802U" if USE_MOCK else "TTTC0802U"  # 국내주식 매수 주문
-TR_ID_KR_ORDER_SELL = "VTTC0801U" if USE_MOCK else "TTTC0801U"  # 국내주식 매도 주문
-TR_ID_KR_BALANCE    = "VTTC8434R" if USE_MOCK else "TTTC8434R"  # 국내주식 잔고조회
-TR_ID_KR_BUYABLE    = "VTTC8908R" if USE_MOCK else "TTTC8908R"  # 국내주식 매수가능조회
+def is_krx_regular_session() -> bool:
+    now = get_kst_now()
+    if now.weekday() >= 5:
+        return False
+    et_min = now.hour * 60 + now.minute
+    return (9 * 60) <= et_min <= (15 * 60 + 30)
 
 
-def get_krx_tick_size(price: float) -> int:
-    """
-    KRX 호가단위(틱사이즈). 가격대별로 다르며, 이 단위에 안 맞으면 주문 자체가 거부될 수 있다.
-    ⚠️ 2023년 이후 개편된 기준. 최신 규정과 다를 수 있으니 필요 시 재확인.
-    """
-    if price < 2_000:
-        return 1
-    if price < 5_000:
-        return 5
-    if price < 20_000:
-        return 10
-    if price < 50_000:
-        return 50
-    if price < 200_000:
-        return 100
-    if price < 500_000:
-        return 500
-    return 1_000
-
-
-def round_to_krx_tick(price: float, side: str) -> int:
-    """
-    가격을 KRX 호가단위에 맞춰 반올림.
-    매수는 체결 확률을 위해 올림, 매도는 내림 방향으로 맞춘다.
-    """
-    tick = get_krx_tick_size(price)
-    if side == "buy":
-        return int((price // tick + 1) * tick) if price % tick != 0 else int(price)
-    else:
-        return int((price // tick) * tick)
-
-
-def place_domestic_order(code: str, qty: int, price: int, side: str, buffer_pct: float = 1.0) -> dict:
-    """
-    국내주식 주문 (현금매수/매도).
-    code: 6자리 종목코드 (예: "005930" 삼성전자)
-    price: 원 단위 기준가 (스냅샷 관측가). 아래에서 buffer_pct만큼 유리하지 않은
-           방향으로(매수는 올려서, 매도는 내려서) 조정 후 KRX 호가단위로 반올림해
-           지정가를 넣는다 — 짧은 시간에 가격이 움직여도 체결 확률을 높이기 위함.
-    side: "buy" 또는 "sell"
-    buffer_pct: 가격 조정 폭(%). 기본 1.0% — 필요 시 조정.
-    """
-    if side not in ("buy", "sell"):
-        raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
-
-    # ── 체결률 개선을 위한 가격 버퍼 ──
-    if side == "buy":
-        adj_price = price * (1 + buffer_pct / 100)
-    else:
-        adj_price = price * (1 - buffer_pct / 100)
-    order_price = round_to_krx_tick(adj_price, side)
-
-    tr_id = TR_ID_KR_ORDER_BUY if side == "buy" else TR_ID_KR_ORDER_SELL
-    body = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "PDNO": code,
-        "ORD_DVSN": "00",   # 00: 지정가
-        "ORD_QTY": str(qty),
-        "ORD_UNPR": str(order_price),
-    }
-    _throttle()
-    resp = requests.post(
-        f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash",
-        headers=_headers(tr_id),
-        json=body,
-        timeout=10,
-    )
-    result = resp.json()
-    if result.get("rt_cd") != "0":
-        print(f"[KIS 국내주문 오류] {code} {side} @ {order_price}원(관측가 {price}) → {result}")
-    else:
-        print(f"[KIS 국내주문 성공] {code} {side} {qty}주 @ {order_price}원(관측가 {price}) → {result.get('msg1')}")
-    return result
-
-
-def get_domestic_balance() -> dict:
-    """국내주식 잔고조회."""
-    params = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "AFHR_FLPR_YN": "N",
-        "OFL_YN": "",
-        "INQR_DVSN": "02",
-        "UNPR_DVSN": "01",
-        "FUND_STTL_ICLD_YN": "N",
-        "FNCG_AMT_AUTO_RDPT_YN": "N",
-        "PRCS_DVSN": "01",
-        "CTX_AREA_FK100": "",
-        "CTX_AREA_NK100": "",
-    }
-    _throttle()
-    resp = requests.get(
-        f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance",
-        headers=_headers(TR_ID_KR_BALANCE),
-        params=params,
-        timeout=10,
-    )
-    return resp.json()
-
-
-def get_domestic_buyable_amount(code: str, price: int) -> float:
-    """
-    국내주식 매수가능금액 조회.
-    ⚠️ 응답 필드명은 실행 후 실제 응답 구조로 재확인 필요 (추정치 사용 중).
-    실패 시 0.0 반환 → 상위 로직이 안전하게 매수 보류하도록.
-    """
-    params = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "PDNO": code,
-        "ORD_UNPR": str(price),
-        "ORD_DVSN": "00",
-        "CMA_EVLU_AMT_ICLD_YN": "N",
-        "OVRS_ICLD_YN": "N",
-    }
+def _send_telegram_chunk(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        _throttle()
-        resp = requests.get(
-            f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
-            headers=_headers(TR_ID_KR_BUYABLE),
-            params=params,
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            print(f"[KIS 국내 매수가능금액 오류] {data}")
-            return 0.0
-        output = data.get("output", {})
-        amt = output.get("ord_psbl_cash") or 0
-        return float(amt)
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
+        if resp.status_code != 200:
+            print(f"[텔레그램 오류] {resp.text}")
     except Exception as e:
-        print(f"[KIS 국내 매수가능금액 예외] {e}")
-        return 0.0
+        print(f"[텔레그램 예외] {e}")
 
 
-# ══════════════════════════════════════════
-# 국내주식 시세/스크리닝 (시세 API는 tr_id가 모의/실전 구분 없이 동일)
-# ⚠️ 응답 필드명은 실제 실행 결과로 재확인 필요 (아래는 통상 알려진 명칭 기준)
-# ══════════════════════════════════════════
+def send_telegram(message: str):
+    TELEGRAM_MAX = 4000
+    if len(message) <= TELEGRAM_MAX:
+        _send_telegram_chunk(message)
+        return
+    lines = message.split("\n")
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > TELEGRAM_MAX:
+            _send_telegram_chunk(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        _send_telegram_chunk(chunk)
 
-TR_ID_KR_RANKING     = "FHPST01700000"   # 국내주식 등락률 순위
-TR_ID_KR_MINUTE_BAR  = "FHKST03010200"   # 국내주식 당일 분봉 조회
-TR_ID_KR_CURRENT_PX  = "FHKST01010100"   # 국내주식 현재가 시세
+
+def notify_kis_order(action: str, code: str, qty: int, price: int, result: dict):
+    rt_cd = result.get("rt_cd")
+    msg1  = result.get("msg1", "")
+    if rt_cd == "0":
+        send_telegram(f"✅ [KIS 국내 모의투자] {code} {action} {qty}주 @ {price:,}원 성공\n{msg1}")
+    else:
+        send_telegram(f"⚠️ [KIS 국내 모의투자] {code} {action} {qty}주 @ {price:,}원 실패 (rt_cd={rt_cd})\n{msg1}")
 
 
-def get_domestic_ranking(top: int = 30) -> list:
-    """
-    국내주식 등락률 순위 조회 (상승률 상위 top개).
-    반환: [{"code": 종목코드, "name": 종목명, "price": 현재가, "change_pct": 등락률}, ...]
-    ⚠️ 응답 필드명(stck_prpr, prdy_ctrt 등)은 KIS 표준 관례 기준 — 실행 후 확인 필요.
-    """
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",     # J: 코스피+코스닥 통합
-        "FID_COND_SCR_DIV_CODE": "20170",
-        "FID_INPUT_ISCD": "0000",
-        "FID_DIV_CLS_CODE": "0",           # 0: 상승률 순
-        "FID_RANK_SORT_CLS_CODE": "0",
-        "FID_INPUT_CNT_1": "0",
-        "FID_PRC_CLS_CODE": "0",
-        "FID_INPUT_PRICE_1": "",
-        "FID_INPUT_PRICE_2": "",
-        "FID_VOL_CNT": "",
-        "FID_TRGT_CLS_CODE": "0",
-        "FID_TRGT_EXLS_CLS_CODE": "0",
-        "FID_INPUT_DATE_1": "",
-    }
+def place_kis_order_safe(code: str, qty: int, price: int, side: str):
     try:
-        _throttle()
-        resp = requests.get(
-            f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
-            headers=_headers(TR_ID_KR_RANKING),
-            params=params,
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            print(f"[KIS 국내 순위조회 오류] {data}")
-            return []
-        rows = data.get("output", [])[:top]
-        result = []
-        for r in rows:
-            try:
-                result.append({
-                    "code": r.get("stck_shrn_iscd") or r.get("mksc_shrn_iscd"),
-                    "name": r.get("hts_kor_isnm"),
-                    "price": float(r.get("stck_prpr", 0)),
-                    "change_pct": float(r.get("prdy_ctrt", 0)),
-                })
-            except (TypeError, ValueError):
-                continue
+        # ── 매도 가드: 실제 잔고 확인 (유령 포지션 방지) ──
+        if side == "sell":
+            _sellable = kis.get_kr_sellable_qty(code)
+            if _sellable <= 0:
+                print(f"  [매도 스킵] {code} 실잔고 0주 (장부 불일치)")
+                sim_positions.pop(code, None)
+                return {"rt_cd": "-1", "msg1": "실잔고 없음 - 매도 스킵"}
+            if qty > _sellable:
+                print(f"  [매도 수량 축소] {code} {qty}주 → {_sellable}주 (실잔고)")
+                qty = _sellable
+        result = kis.place_domestic_order(code, qty, price, side)
+        notify_kis_order("매수" if side == "buy" else "매도", code, qty, price, result)
         return result
     except Exception as e:
-        print(f"[KIS 국내 순위조회 예외] {e}")
-        return []
+        print(f"[KIS 국내주문 예외] {code} {side} → {e}")
+        send_telegram(f"⚠️ [KIS 국내 모의투자] {code} {side} 주문 예외: {e}")
+        return {"rt_cd": "-1", "msg1": str(e)}
 
 
-def get_domestic_minute_bars(code: str, count: int = 30) -> list:
+# ──────────────────────────────────────────
+# 지표 계산 (해외주식봇과 동일 로직 재사용)
+# ──────────────────────────────────────────
+
+def calc_rsi(bars, period=14):
+    if len(bars) < period + 1:
+        return None
+    closes = [b["c"] for b in bars]
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0)); losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+def calc_volume_surge(bars):
+    if len(bars) < 6:
+        return 0.0, False
+    recent_5 = bars[-5:]
+    history = bars[:-5][-20:]
+    if not history:
+        return 0.0, False
+    avg_vol = sum(b["v"] for b in history) / len(history)
+    if avg_vol <= 0:
+        return 0.0, False
+    ratio = sum(b["v"] for b in recent_5) / (avg_vol * 5)
+    return ratio, ratio >= 1.5
+
+
+def calc_entry_score(price_change_1m: float, vol_ratio: float, rsi) -> float:
     """
-    국내주식 당일 분봉 조회.
-    반환: Alpaca 봉 형식과 호환되도록 [{"t","o","h","l","c","v"}, ...] (시간순 오름차순)
-    ⚠️ 응답 필드명(stck_cntg_hour, stck_prpr 등) 재확인 필요.
+    [v2] 해외주식봇 v35 스타일 가중점수 (10점 만점).
+    - 1분 변화율 (0.5 가중): 10%p까지 선형, 그 이상은 캡
+    - 거래량서지 (0.3 가중): 5배까지 선형, 그 이상은 캡
+    - RSI (0.2 가중): 과매수(70+)일수록 가산 — 필터가 아니라 모멘텀 강도로 취급
+    RSI/거래량은 진입을 막는 조건이 아니라 우선순위를 정하는 데만 쓰임.
     """
-    params = {
-        "FID_ETC_CLS_CODE": "",
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD": code,
-        "FID_INPUT_HOUR_1": "",
-        "FID_PW_DATA_INCU_YN": "Y",
-    }
-    try:
-        _throttle()
-        resp = requests.get(
-            f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-            headers=_headers(TR_ID_KR_MINUTE_BAR),
-            params=params,
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            print(f"[KIS 국내 분봉조회 오류] {code} {data}")
-            return []
-        rows = data.get("output2", [])[:count]
-        bars = []
-        for r in reversed(rows):   # KIS는 최신순 반환 → 오름차순으로 뒤집기
-            try:
-                bars.append({
-                    "t": r.get("stck_cntg_hour"),
-                    "o": float(r.get("stck_oprc", 0)),
-                    "h": float(r.get("stck_hgpr", 0)),
-                    "l": float(r.get("stck_lwpr", 0)),
-                    "c": float(r.get("stck_prpr", 0)),
-                    "v": float(r.get("cntg_vol", 0)),
-                })
-            except (TypeError, ValueError):
+    change_score = min(max(price_change_1m, 0.0), 10.0)
+    volume_score = min(max(vol_ratio, 0.0), 5.0) * 2.0
+    if rsi is None:
+        rsi_score = 5.0
+    elif rsi >= 70:
+        rsi_score = 10.0
+    elif rsi >= 50:
+        rsi_score = 7.0
+    elif rsi >= 40:
+        rsi_score = 4.0
+    else:
+        rsi_score = 0.0
+    return change_score * 0.5 + volume_score * 0.3 + rsi_score * 0.2
+
+
+def is_preferred_stock(name: str) -> bool:
+    """우선주 이름 패턴(우, 1우, 2우B, 3우C 등) 감지 → 국내장 전용 제외 필터."""
+    return bool(re.search(r"\d*우[A-Z]?$", name or ""))
+
+
+# ──────────────────────────────────────────
+# 시뮬레이션 + KIS 실주문
+# ──────────────────────────────────────────
+
+def sim_open(code: str, name: str, price: float) -> bool:
+    if code in sim_positions or code in blacklisted_today:
+        return False
+    if len(sim_positions) >= MAX_POSITIONS:
+        return False
+    remaining = max(MAX_POSITIONS - len(sim_positions), 1)  # 방어적 최소값 (0/음수 나눗셈 방지)
+
+    if LIVE_TRADING:
+        # [v3] 가상 캐시(sim_stats) 대신 실계좌 매수가능금액을 기준으로 예산 산정.
+        #      restore_positions_from_account()로 포지션이 복원돼도 sim_stats["cash"]가
+        #      실제 잔고와 어긋나는 문제가 있었기 때문에, 실전 주문 여부와 관계없이
+        #      "얼마나 살지"는 항상 실계좌 조회값을 기준으로 판단한다.
+        real_buyable = kis.get_domestic_buyable_amount(code, int(price))
+        if real_buyable <= 0:
+            print(f"  [매수 불가] {code} KIS 매수가능금액 조회 실패/0")
+            return False
+        budget = real_buyable / remaining  # [v5] 총상한 캡 제거 - 예수금 전액을 3슬롯으로 분산
+    else:
+        budget = sim_stats["cash"] / remaining
+
+    qty = int(budget // net_entry_cost(price))  # [v7] 매수 비용률까지 감안해서 수량 산정
+    if qty < 1:
+        print(f"  [매수 불가] {code} 예수금 부족 (예산={budget:.0f}, 1주={price:.0f})")
+        return False
+
+    cost = net_entry_cost(price) * qty
+    sim_stats["cash"] -= cost
+    sim_positions[code] = {"entry": price, "qty": qty, "name": name}
+    now_kst = get_kst_now()
+    trade_log.append({"action": "BUY", "sym": code, "name": name, "qty": qty, "price": price,
+                       "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수", "time_kst": now_kst.strftime("%H:%M")})
+    print(f"  [시뮬 매수] {code}({name}) {qty}주 @ {price:.0f}원 | 잔여: {sim_stats['cash']:.0f}원")
+
+    if LIVE_TRADING:
+        place_kis_order_safe(code, qty, int(price), "buy")
+    return True
+
+
+def sim_close(code: str, exit_price: float, reason: str, qty: int = None):
+    global daily_realized_pnl, daily_target_hit
+    pos = sim_positions.get(code)
+    if not pos:
+        return
+    entry_price = pos["entry"]
+    close_qty = qty if qty is not None else pos["qty"]
+    entry_cost_ps = net_entry_cost(entry_price)      # 1주당 실제 매수원가(수수료 포함)
+    exit_proceeds_ps = net_exit_proceeds(exit_price)  # 1주당 실제 매도수령액(수수료·세금 차감)
+    pnl = (exit_proceeds_ps - entry_cost_ps) * close_qty          # [v7] 수수료·세금 반영 순손익
+    pnl_pct = (exit_proceeds_ps - entry_cost_ps) / entry_cost_ps * 100
+
+    sim_stats["cash"] += exit_proceeds_ps * close_qty
+    pos["qty"] -= close_qty
+    if pos["qty"] <= 0:
+        del sim_positions[code]
+        entry_prices.pop(code, None)
+        sim_stats["total_pnl"] += pnl
+        sim_stats["trades"] += 1
+        sim_stats["wins" if pnl >= 0 else "losses"] += 1
+    else:
+        sim_stats["total_pnl"] += pnl
+
+    # [v6] 일일 누적 수익목표 체크 (실현손익 기준)
+    daily_realized_pnl += pnl
+    if not daily_target_hit and daily_start_balance > 0:
+        daily_ret_pct = daily_realized_pnl / daily_start_balance * 100
+        if daily_ret_pct >= DAILY_PROFIT_TARGET_PCT:
+            daily_target_hit = True
+            print(f"[🎯 일일 목표 도달] 누적 {daily_ret_pct:+.2f}% ≥ {DAILY_PROFIT_TARGET_PCT}% — 오늘 신규 매수 중단")
+            send_telegram(
+                f"🎯 <b>일일 목표수익률 {DAILY_PROFIT_TARGET_PCT}% 도달!</b>\n"
+                f"오늘 실현손익 {daily_realized_pnl:+,.0f}원 ({daily_ret_pct:+.2f}%)\n"
+                f"오늘은 신규 매수를 중단합니다 (보유종목 매도/손절 감시는 계속 진행)."
+            )
+
+    if "손절" in reason:
+        stop_loss_count[code] = stop_loss_count.get(code, 0) + 1
+        if stop_loss_count[code] > MAX_STOP_LOSS_COUNT:
+            blacklisted_today.add(code)
+
+    now_kst = get_kst_now()
+    trade_log.append({"action": "SELL", "sym": code, "name": pos.get("name", code), "qty": close_qty,
+                       "price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+                       "time_kst": now_kst.strftime("%H:%M")})
+
+    if LIVE_TRADING:
+        place_kis_order_safe(code, close_qty, int(exit_price), "sell")
+
+
+# ──────────────────────────────────────────
+# 매도 타이밍
+# ──────────────────────────────────────────
+
+def check_sell_timing(code: str, current_price: float):
+    if code not in entry_prices:
+        return
+    entry = entry_prices[code]
+    entry_price = entry["entry"]
+    now = datetime.now(timezone_utc())
+    gain_pct = net_gain_pct(entry_price, current_price)  # [v7] 수수료·세금 반영 순수익률 기준
+
+    # 고점 갱신 (트레일링 스탑 기준선)
+    peak = entry.get("peak_gain")
+    if peak is None or gain_pct > peak:
+        entry["peak_gain"] = gain_pct
+        peak = gain_pct
+
+    def cooldown_ok(key):
+        last = entry.get(key)
+        return last is None or (now - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
+
+    # 1) 손절 (최우선, 쿨다운 없이 즉시)
+    if gain_pct <= STOP_LOSS_PCT:
+        entry["stop"] = now
+        sim_close(code, current_price, f"손절({STOP_LOSS_PCT:.0f}%)")
+        print(f"[🔴 손절] {code} {entry_price:.0f}→{current_price:.0f} (순 {gain_pct:+.2f}%)")
+        return
+
+    # 2) 하드 상한 익절 (트레일링 기다리지 않고 즉시 확정)
+    if gain_pct >= SELL_FULL_PCT:
+        sim_close(code, current_price, f"+{SELL_FULL_PCT:.0f}% 상한 익절")
+        print(f"[🟢 상한 익절] {code} {entry_price:.0f}→{current_price:.0f} (순 {gain_pct:+.2f}%)")
+        return
+
+    # 3) 트레일링 스탑: 활성화 구간 진입 후 고점 대비 되밀리면 청산 (수익 보존)
+    if peak >= TRAIL_ACTIVATE_PCT and (peak - gain_pct) >= TRAIL_GAP_PCT:
+        if cooldown_ok("alert2"):
+            entry["alert2"] = now
+            sim_close(code, current_price, f"트레일링(고점{peak:+.1f}%→{gain_pct:+.1f}%)")
+            print(f"[🟡 트레일링 청산] {code} 고점{peak:+.2f}% → 현재{gain_pct:+.2f}%")
+
+
+def timezone_utc():
+    from datetime import timezone
+    return timezone.utc
+
+
+def monitor_positions():
+    """보유종목 전량, 스캔과 분리된 짧은 주기로 체크 (해외주식봇 개선사항 반영)."""
+    if not entry_prices:
+        return
+    for code in list(entry_prices.keys()):
+        price = kis.get_domestic_current_price(code)
+        if price:
+            check_sell_timing(code, price)
+
+
+# ──────────────────────────────────────────
+# 스캔
+# ──────────────────────────────────────────
+
+def run_scan():
+    ranked = kis.get_domestic_ranking(top=TOP_N)
+    if not ranked:
+        print("  [순위조회 실패/빈 결과]")
+        return
+
+    # ── 1단계: 기본 필터 통과 종목의 점수 계산 (즉시 매수하지 않고 후보로만 수집) ──
+    candidates = []
+    for stock in ranked:
+        code = stock["code"]
+        if not code or stock["price"] < MIN_PRICE:
+            continue
+        if code in blacklisted_today or code in sim_positions:
+            continue
+        if is_preferred_stock(stock.get("name", "")):
+            continue  # [v2] 우선주 제외
+        if stock.get("change_pct", 0) >= LIMIT_UP_THRESHOLD:
+            continue  # [v2] 상한가 근접 제외 (더 못 먹고 급락 리스크만 남은 구간)
+        if code in last_alert:
+            elapsed = (get_kst_now() - last_alert[code]).total_seconds() / 60
+            if elapsed < COOLDOWN_MINUTES:
                 continue
-        return bars
-    except Exception as e:
-        print(f"[KIS 국내 분봉조회 예외] {code} {e}")
-        return []
+
+        bars = kis.get_domestic_minute_bars(code)
+        if len(bars) < 6:
+            continue  # 분봉 부족 = 거래정지/신규상장 등, 자연히 제외됨
+        price_1m_ago = bars[-2]["c"]
+        if price_1m_ago <= 0:
+            continue
+        price_change_1m = ((stock["price"] - price_1m_ago) / price_1m_ago) * 100
+        if price_change_1m < PRICE_CHANGE_1M:
+            continue  # 1분 급등은 여전히 최소 진입선 (0/1 필터)
+
+        rsi = calc_rsi(bars)
+        vol_ratio, _ = calc_volume_surge(bars)
+        score = calc_entry_score(price_change_1m, vol_ratio, rsi)
+        print(f"[🚀 후보] {code}({stock['name']}) 1분{price_change_1m:+.2f}% RSI{rsi} 거래량{vol_ratio:.1f}x 점수{score:.1f} 가격{stock['price']:.0f}원")
+
+        if score < MIN_ENTRY_SCORE:
+            continue  # [v2] 점수 미달은 후보에서 제외
+
+        candidates.append({"code": code, "name": stock["name"], "price": stock["price"], "score": score})
+        time.sleep(0.3)
+
+    # ── 2단계: 점수 높은 순으로 정렬 후 슬롯 수만큼만 매수 ──
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    bought_this_scan = 0
+    for c in candidates:
+        if bought_this_scan >= MAX_BUY_PER_SCAN:
+            break
+        code = c["code"]
+        last_alert[code] = get_kst_now()
+        entry_prices[code] = {"entry": c["price"], "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
+        if sim_open(code, c["name"], c["price"]):
+            bought_this_scan += 1
+            print(f"  [✅ 매수] {code}({c['name']}) 점수{c['score']:.1f}")
+        else:
+            entry_prices.pop(code, None)
 
 
-def get_domestic_current_price(code: str) -> float:
-    """국내주식 현재가 단건 조회. 실패 시 0.0."""
-    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+def _get_real_deposit_safe():
+    """
+    [v3] 실계좌 예수금 조회 (리포트 표시용). 실패해도 봇 로직에 영향 없도록 예외를 삼킨다.
+    ⚠️ output2 응답 필드명(dnca_tot_amt)은 국내 잔고조회 관례 기준 — 실제 응답으로 재확인 필요.
+    """
     try:
-        _throttle()
-        resp = requests.get(
-            f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
-            headers=_headers(TR_ID_KR_CURRENT_PX),
-            params=params,
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("rt_cd") != "0":
-            return 0.0
-        return float(data.get("output", {}).get("stck_prpr", 0))
-    except Exception:
-        return 0.0
+        bal = kis.get_domestic_balance()
+        output2 = bal.get("output2")
+        row = output2[0] if isinstance(output2, list) and output2 else (output2 or {})
+        return float(row.get("dnca_tot_amt", 0) or 0)
+    except Exception as e:
+        print(f"[실계좌 예수금 조회 실패] {e}")
+        return None
 
 
+def build_report(title: str) -> str:
+    win_rate = sim_stats["wins"] / sim_stats["trades"] * 100 if sim_stats["trades"] else 0.0
+    total_return = sim_stats["total_pnl"] / sim_stats["initial_cash"] * 100
+    lines = [f"📋 <b>{title}</b>", f"🇰🇷 {get_kst_now().strftime('%m/%d %H:%M')} KST", "━━━━━━━━━━━━━━"]
+    if trade_log:
+        for t in trade_log[-30:]:
+            icon = "📥" if t["action"] == "BUY" else ("📈" if t["pnl"] >= 0 else "📉")
+            if t["action"] == "BUY":
+                lines.append(f"  {icon} {t['time_kst']} {t['sym']}({t.get('name','')}) {t['qty']}주 매수 @ {t['price']:.0f}원")
+            else:
+                lines.append(f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 {t['reason']} @ {t['price']:.0f}원 ({t['pnl']:+.0f}원, {t['pnl_pct']:+.2f}%)")
+    else:
+        lines.append("거래 내역 없음")
+    lines.append("━━━━━━━━━━━━━━")
+    # ── 종목별 요약 (청산 거래만) ──
+    _closed = [t for t in trade_log if t.get("reason") != "매수"]  # [v6 버그수정] daily_trades(미정의) → trade_log
+    if _closed:
+        _by = {}
+        for t in _closed:
+            s = _by.setdefault(t["sym"], {"pnl": 0.0, "n": 0})
+            s["pnl"] += t.get("pnl", 0.0); s["n"] += 1
+        lines.append("📊 <b>종목별 요약</b>")
+        for sym, s in sorted(_by.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
+            ic = "🔴" if s["pnl"] > 0 else ("🔵" if s["pnl"] < 0 else "⚪")
+            lines.append(f"  {ic} {sym}: {s['pnl']:+,.0f}원 ({s['n']}건)")
+        _best = max(_closed, key=lambda t: t.get("pnl", 0.0))
+        _worst = min(_closed, key=lambda t: t.get("pnl", 0.0))
+        lines.append(f"  🏆 베스트: {_best['sym']} {_best.get('pnl',0):+,.0f}원")
+        lines.append(f"  📉 워스트: {_worst['sym']} {_worst.get('pnl',0):+,.0f}원")
+        _w = [t["pnl"] for t in _closed if t.get("pnl",0) > 0]
+        _l = [t["pnl"] for t in _closed if t.get("pnl",0) < 0]
+        if _w and _l:
+            aw = sum(_w)/len(_w); al = abs(sum(_l)/len(_l))
+            if al > 0:
+                lines.append(f"  ⚖️ 손익비: {aw/al:.2f} (평균익 {aw:+,.0f}원 / 평균손 -{al:,.0f}원)")
+        lines.append("━" * 14)
+
+    lines.append(f"💵 예수금(시뮬 추정, 참고용): {sim_stats['cash']:,.0f}원")
+    if LIVE_TRADING:
+        real_cash = _get_real_deposit_safe()
+        if real_cash is not None:
+            lines.append(f"🏦 실계좌 예수금: {real_cash:,.0f}원")
+    lines.append(f"💰 누적손익: {sim_stats['total_pnl']:+,.0f}원 ({total_return:+.2f}%)")
+    if daily_start_balance > 0:
+        _daily_ret = daily_realized_pnl / daily_start_balance * 100
+        _flag = "✅ 달성" if daily_target_hit else "진행중"
+        lines.append(f"📅 오늘 누적: {daily_realized_pnl:+,.0f}원 ({_daily_ret:+.2f}% / 목표 +{DAILY_PROFIT_TARGET_PCT}%, {_flag})")
+    lines.append(f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 (승률 {win_rate:.0f}%)")
+    return "\n".join(lines)
+
+
+def restore_positions_from_account():
+    """봇 시작 시 실계좌 잔고를 읽어 감시 대상(entry_prices/sim_positions) 복원.
+    [v3] sim_stats["cash"]는 여기서 조정하지 않는다 — 이제 LIVE_TRADING 예산 계산은
+    sim_stats["cash"]가 아니라 실계좌 매수가능금액을 매번 직접 조회해 쓰므로,
+    복원 시점에 가상 캐시를 맞추지 않아도 예산 계산이 틀어지지 않는다.
+    (sim_stats["cash"]는 리포트의 참고용 P&L 추정치로만 사용됨)
+    """
+    try:
+        bal = kis.get_domestic_balance()
+    except Exception as e:
+        print(f"[포지션 복원 실패] {e}")
+        return
+    restored = 0
+    skipped_ghost = 0
+    for h in bal.get("output1", []):
+        code = h.get("pdno")
+        qty = int(h.get("hldg_qty", 0) or 0)
+        avg = float(h.get("pchs_avg_pric", 0) or 0)
+        name = h.get("prdt_name", "")
+        if not code or qty <= 0 or avg <= 0:
+            continue
+        if code in entry_prices:
+            continue
+
+        # [v8] 유령 포지션 방지: 잔고조회(hldg_qty)엔 찍혀도 실제 매도가능수량이 0이면
+        #      감시 등록 자체를 하지 않는다. (모의계좌 리셋 등으로 잔고API와 실제
+        #      sellable 수량이 어긋나면, 등록 후 sim_close에서 가짜 손절 거래가
+        #      trade_log/리포트에 섞여 들어가는 문제가 있었음 → 원천 차단)
+        try:
+            sellable = kis.get_kr_sellable_qty(code)
+        except Exception as e:
+            print(f"[포지션 복원] {code} 매도가능수량 조회 실패({e}) - 안전하게 건너뜀")
+            continue
+        if sellable <= 0:
+            print(f"[포지션 복원 스킵] {code} 잔고 {qty}주 표시되지만 매도가능 0주 (유령 포지션 추정)")
+            skipped_ghost += 1
+            continue
+        qty = min(qty, sellable)
+
+        entry_prices[code] = {"entry": avg, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
+        sim_positions[code] = {"entry": avg, "qty": qty, "name": name}
+        restored += 1
+    if restored:
+        print(f"[포지션 복원] 실계좌 {restored}종목 감시 등록 완료")
+        send_telegram(f"🔄 [국장] 실계좌 {restored}종목 감시 복원 완료 (손절/익절 감시 시작)")
+    if skipped_ghost:
+        print(f"[포지션 복원] 유령 포지션 {skipped_ghost}종목 감시 제외")
+        send_telegram(f"⚠️ [국장] 잔고API 표시 vs 실제 매도가능 불일치 {skipped_ghost}종목 감시 제외 (유령 포지션 추정)")
+
+
+def main():
+    global market_close_sent, daily_start_balance, daily_realized_pnl, daily_target_hit
+    print("=" * 60)
+    print("🚀 국내주식(KRX) 급등 감지 봇 시작! (v4)")
+    print(f"🔌 LIVE_TRADING: {'ON (KIS 국내 모의투자 연동)' if LIVE_TRADING else 'OFF (시뮬만)'}")
+    print(f"📈 1분 {PRICE_CHANGE_1M}%+ (1차필터) → 가중점수 {MIN_ENTRY_SCORE}점+ 만 매수 | {MIN_PRICE:,}원+ | 상위 {TOP_N}종목")
+    print(f"🛡️ 상한가({LIMIT_UP_THRESHOLD}%+) 근접·우선주 제외")
+    print(f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산 (누적, 몰빵 아님)")
+    print(f"🎯 매도: 손절 {STOP_LOSS_PCT}%(net) | 트레일링 활성 +{TRAIL_ACTIVATE_PCT}%→고점대비 -{TRAIL_GAP_PCT}%p 청산 | 상한 +{SELL_FULL_PCT}%(net)")
+    print(f"📅 일일 누적목표: +{DAILY_PROFIT_TARGET_PCT}% 도달 시 그날 신규 매수 중단 (보유종목 감시는 계속)")
+    print(f"⏰ 매수 마감 {BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} | 정리매매(전량청산) {LIQUIDATION_HOUR}:{LIQUIDATION_MINUTE:02d} (동시호가 전, 당일 매수·당일 매도)")
+    print(f"⚡ 보유종목 {POSITION_CHECK_INTERVAL}초 주기 체크")
+    print("=" * 60)
+
+    send_telegram(
+        f"🤖 <b>국내주식(KRX) 급등 감지 봇 시작! (v4)</b>\n"
+        f"🔌 LIVE_TRADING: <b>{'ON' if LIVE_TRADING else 'OFF (시뮬만)'}</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ 1차필터 → 가중점수 {MIN_ENTRY_SCORE}점+ 매수 | {MIN_PRICE:,}원+ 종목만\n"
+        f"🛡️ 상한가 근접·우선주 제외\n"
+        f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산 (누적, 몰빵 아님)\n"
+        f"🎯 손절 {STOP_LOSS_PCT}%(net) | 트레일링 +{TRAIL_ACTIVATE_PCT}%→-{TRAIL_GAP_PCT}%p | 상한 +{SELL_FULL_PCT}%(net)\n"
+        f"📅 일일 누적목표 +{DAILY_PROFIT_TARGET_PCT}% 도달 시 신규매수 중단\n"
+        f"⏰ 매수마감 {BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} | 정리매매 {LIQUIDATION_HOUR}:{LIQUIDATION_MINUTE:02d}"
+    )
+
+    last_scan_time = 0.0
+    restore_positions_from_account()
+
+    # [v6] 봇이 장중에 (재)시작되는 경우도 있으므로, 9:00 정각 리셋과 별개로
+    # 시작 시점에도 기준자본이 비어있으면 한 번 채워둔다.
+    if daily_start_balance <= 0 and LIVE_TRADING:
+        daily_start_balance = _get_real_deposit_safe() or 0.0
+        print(f"[일일 기준자본] {daily_start_balance:,.0f}원 (목표 +{DAILY_PROFIT_TARGET_PCT}%)")
+
+    while True:
+        try:
+            now_str = get_kst_now().strftime("%H:%M:%S")
+
+            if get_kst_now().hour == 9 and get_kst_now().minute == 0:
+                if blacklisted_today or stop_loss_count or trade_log or last_alert or daily_target_hit:
+                    blacklisted_today.clear(); stop_loss_count.clear()
+                    trade_log.clear(); last_alert.clear()
+                    market_close_sent = False
+                    daily_realized_pnl = 0.0
+                    daily_target_hit = False
+                    daily_start_balance = _get_real_deposit_safe() or 0.0
+                    print(f"[일일 리셋] 기준자본 {daily_start_balance:,.0f}원 (목표 +{DAILY_PROFIT_TARGET_PCT}%)")
+
+            if not is_krx_regular_session():
+                print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
+                time.sleep(POSITION_CHECK_INTERVAL)
+                continue
+
+            if get_kst_now().hour == LIQUIDATION_HOUR and get_kst_now().minute >= LIQUIDATION_MINUTE and not market_close_sent:
+                market_close_sent = True
+                for code in list(sim_positions.keys()):
+                    price = kis.get_domestic_current_price(code)
+                    if price:
+                        sim_close(code, price, "정리매매(동시호가 전 강제청산)")
+                send_telegram(build_report("🔔 정리매매 완료 최종 매매일지"))
+
+            monitor_positions()
+
+            now_kst = get_kst_now()
+            buy_window_open = (now_kst.hour, now_kst.minute) < (BUY_CUTOFF_HOUR, BUY_CUTOFF_MINUTE) and not daily_target_hit
+
+            now_mono = time.monotonic()
+            if now_mono - last_scan_time >= CHECK_INTERVAL:
+                last_scan_time = now_mono
+                if buy_window_open:
+                    print(f"\n[{now_str}] 정규장 스캔 시작")
+                    run_scan()
+                elif daily_target_hit:
+                    print(f"[{now_str}] 일일 목표수익 도달 — 신규 스캔 생략, 보유종목 청산 대기만 진행")
+                else:
+                    print(f"[{now_str}] 매수 마감 시간({BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} 이후) — 신규 스캔 생략, 보유종목 청산 대기만 진행")
+
+            time.sleep(POSITION_CHECK_INTERVAL)
+
+
+        except Exception as _loop_e:
+            print(f"[\ub8e8\ud504 \uc624\ub958] {_loop_e}")
+            import traceback; traceback.print_exc()
+            time.sleep(POSITION_CHECK_INTERVAL)
 if __name__ == "__main__":
-    # 단독 실행 시 토큰 발급 + 해외/국내 잔고 조회 테스트
-    print(f"[모드] {'모의투자' if USE_MOCK else '⚠️ 실전투자'}")
-    token = get_access_token()
-    print(f"[토큰] {token[:20]}...")
-
-    print("\n── 해외주식 잔고 ──")
-    print(json.dumps(get_overseas_balance(), indent=2, ensure_ascii=False))
-
-    print("\n── 국내주식 잔고 ──")
-    print(json.dumps(get_domestic_balance(), indent=2, ensure_ascii=False))
-
-    print("\n── 국내주식 등락률 순위 (상위 5) ──")
-    print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
-
-
+    main()
