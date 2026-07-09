@@ -78,7 +78,7 @@ def _headers(tr_id: str) -> dict:
 # KIS는 계정 등급에 따라 초당 허용 호출 수가 정해져 있어, 짧은 시간에
 # 여러 함수(잔고조회→매수가능조회→주문 등)가 연달아 호출되면 거절될 수 있다.
 _last_request_ts = 0.0
-_MIN_REQUEST_INTERVAL = 0.5   # 최소 호출 간격(초). 계속 걸리면 값을 늘릴 것.
+_MIN_REQUEST_INTERVAL = 1.0   # 최소 호출 간격(초). EGW00201(초당 거래건수 초과) 나면 더 늘릴 것.
 
 
 def _throttle():
@@ -454,14 +454,13 @@ def get_domestic_ranking(top: int = 30) -> list:
         "FID_RSFL_RATE2": "30",   # 등락비율 상한(%) - 상한가(약 30%)까지 포함
     }
     try:
-        _throttle()
-        resp = requests.get(
+        data = _request_with_retry(
+            "get",
             f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
             headers=_headers(TR_ID_KR_RANKING),
             params=params,
             timeout=10,
         )
-        data = resp.json()
         if data.get("rt_cd") != "0":
             print(f"[KIS 국내 순위조회 오류] rt_cd={data.get('rt_cd')} msg_cd={data.get('msg_cd')} msg1={data.get('msg1')}")
             print(f"[KIS 국내 순위조회 오류 전체응답] {data}")
@@ -498,14 +497,13 @@ def get_domestic_minute_bars(code: str, count: int = 30) -> list:
         "FID_PW_DATA_INCU_YN": "Y",
     }
     try:
-        _throttle()
-        resp = requests.get(
+        data = _request_with_retry(
+            "get",
             f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             headers=_headers(TR_ID_KR_MINUTE_BAR),
             params=params,
             timeout=10,
         )
-        data = resp.json()
         if data.get("rt_cd") != "0":
             print(f"[KIS 국내 분봉조회 오류] {code} {data}")
             return []
@@ -533,14 +531,13 @@ def get_domestic_current_price(code: str) -> float:
     """국내주식 현재가 단건 조회. 실패 시 0.0."""
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
     try:
-        _throttle()
-        resp = requests.get(
+        data = _request_with_retry(
+            "get",
             f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=_headers(TR_ID_KR_CURRENT_PX),
             params=params,
             timeout=10,
         )
-        data = resp.json()
         if data.get("rt_cd") != "0":
             return 0.0
         return float(data.get("output", {}).get("stck_prpr", 0))
