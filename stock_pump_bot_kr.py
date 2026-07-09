@@ -564,6 +564,7 @@ def restore_positions_from_account():
         print(f"[포지션 복원 실패] {e}")
         return
     restored = 0
+    skipped_ghost = 0
     for h in bal.get("output1", []):
         code = h.get("pdno")
         qty = int(h.get("hldg_qty", 0) or 0)
@@ -573,12 +574,31 @@ def restore_positions_from_account():
             continue
         if code in entry_prices:
             continue
+
+        # [v8] 유령 포지션 방지: 잔고조회(hldg_qty)엔 찍혀도 실제 매도가능수량이 0이면
+        #      감시 등록 자체를 하지 않는다. (모의계좌 리셋 등으로 잔고API와 실제
+        #      sellable 수량이 어긋나면, 등록 후 sim_close에서 가짜 손절 거래가
+        #      trade_log/리포트에 섞여 들어가는 문제가 있었음 → 원천 차단)
+        try:
+            sellable = kis.get_kr_sellable_qty(code)
+        except Exception as e:
+            print(f"[포지션 복원] {code} 매도가능수량 조회 실패({e}) - 안전하게 건너뜀")
+            continue
+        if sellable <= 0:
+            print(f"[포지션 복원 스킵] {code} 잔고 {qty}주 표시되지만 매도가능 0주 (유령 포지션 추정)")
+            skipped_ghost += 1
+            continue
+        qty = min(qty, sellable)
+
         entry_prices[code] = {"entry": avg, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
         sim_positions[code] = {"entry": avg, "qty": qty, "name": name}
         restored += 1
     if restored:
         print(f"[포지션 복원] 실계좌 {restored}종목 감시 등록 완료")
         send_telegram(f"🔄 [국장] 실계좌 {restored}종목 감시 복원 완료 (손절/익절 감시 시작)")
+    if skipped_ghost:
+        print(f"[포지션 복원] 유령 포지션 {skipped_ghost}종목 감시 제외")
+        send_telegram(f"⚠️ [국장] 잔고API 표시 vs 실제 매도가능 불일치 {skipped_ghost}종목 감시 제외 (유령 포지션 추정)")
 
 
 def main():
