@@ -9,6 +9,8 @@
   KIS_APP_SECRET    - 발급받은 앱시크릿
   KIS_ACCOUNT_NO    - 계좌번호 전체 (예: 12345678-01)
   KIS_USE_MOCK      - "true"면 모의투자 서버 사용, "false"면 실전 서버 (기본: true)
+  KIS_ALLOW_REAL    - 실전(KIS_USE_MOCK=false) 기동 이중잠금. "true"여야 실전 실행 허용 (기본: false)
+  KIS_MAX_ORDER_USD - 실전 해외주문 1건 금액 상한(USD). 초과 주문은 차단. 0이면 무제한 (기본: 0)
 """
 
 import os
@@ -20,6 +22,17 @@ KIS_APP_KEY    = os.environ["KIS_APP_KEY"]
 KIS_APP_SECRET = os.environ["KIS_APP_SECRET"]
 KIS_ACCOUNT_NO = os.environ["KIS_ACCOUNT_NO"]   # "12345678-01" 형태
 USE_MOCK       = os.environ.get("KIS_USE_MOCK", "true").lower() == "true"
+ALLOW_REAL     = os.environ.get("KIS_ALLOW_REAL", "false").lower() == "true"
+MAX_ORDER_USD  = float(os.environ.get("KIS_MAX_ORDER_USD", "0"))   # 0 = 무제한
+
+# ── 실전 이중잠금 ──
+# USE_MOCK=false(실전)인데 ALLOW_REAL=true가 없으면 기동 자체를 거부한다.
+# 설정 오타 하나로 검증 안 된 로직이 실전 자금에 붙는 사고를 막기 위한 안전장치.
+if not USE_MOCK and not ALLOW_REAL:
+    raise SystemExit(
+        "[안전잠금] 실전 모드(KIS_USE_MOCK=false)인데 KIS_ALLOW_REAL=true가 없습니다. "
+        "실전 가동을 의도한 게 맞으면 env에 KIS_ALLOW_REAL=true를 추가하세요."
+    )
 
 CANO         = KIS_ACCOUNT_NO.split("-")[0]          # 계좌번호 앞 8자리
 ACNT_PRDT_CD = KIS_ACCOUNT_NO.split("-")[1]           # 상품코드 뒤 2자리
@@ -138,6 +151,14 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
 
+    # ── 실전 주문금액 상한(안전장치) ──
+    # 실전에서만 동작. qty*price가 상한(USD)을 넘으면 주문을 KIS로 보내지 않고 차단한다.
+    # 수량 계산 버그 등으로 과대 주문이 나가는 사고를 막는 최후의 방어선.
+    if not USE_MOCK and MAX_ORDER_USD > 0 and qty * price > MAX_ORDER_USD:
+        msg = f"실전 주문금액 ${qty * price:.2f} > 상한 ${MAX_ORDER_USD:.2f} → 주문 차단"
+        print(f"[안전차단] {symbol} {side} {msg}")
+        return {"rt_cd": "-1", "msg1": msg}
+
     from session_utils import get_ord_dvsn_for_session
     ord_dvsn = get_ord_dvsn_for_session(session)
 
@@ -185,6 +206,12 @@ def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: st
     """
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
+
+    # ── 실전 주문금액 상한(안전장치) ── place_order와 동일 규칙 적용
+    if not USE_MOCK and MAX_ORDER_USD > 0 and qty * price > MAX_ORDER_USD:
+        msg = f"실전 주간거래 주문금액 ${qty * price:.2f} > 상한 ${MAX_ORDER_USD:.2f} → 주문 차단"
+        print(f"[안전차단] {symbol} {side} {msg}")
+        return {"rt_cd": "-1", "msg1": msg}
 
     tr_id = TR_ID_DAY_BUY if side == "buy" else TR_ID_DAY_SELL
 
@@ -429,6 +456,9 @@ def get_kr_holding_qty(code: str) -> int:
             except (TypeError, ValueError):
                 return 0
     return 0
+
+
+def get_kr_buyable_amount(code: str, price: int) -> float:
     """
     국내주식 매수가능금액 조회.
     ⚠️ 응답 필드명은 실행 후 실제 응답 구조로 재확인 필요 (추정치 사용 중).
@@ -602,5 +632,3 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 등락률 순위 (상위 5) ──")
     print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
-
-
