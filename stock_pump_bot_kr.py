@@ -527,4 +527,4 @@ def build_report(title: str) -> str:
         if _w and _l:
             aw = sum(_w)/len(_w); al = abs(sum(_l)/len(_l))
             if al > 0:
-                lines.append(f"  ⚖️ 손익비: {
+                lines.append(f"  ⚖️ 손익비: {aw/al:.2f} (평균익 {aw:+,.0f}원 / 평균손 -{al:,.0f}원)")
