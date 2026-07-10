@@ -458,7 +458,7 @@ def get_kr_holding_qty(code: str) -> int:
     return 0
 
 
-def get_kr_buyable_amount(code: str, price: int) -> float:
+def get_domestic_buyable_amount(code: str, price: int) -> float:
     """
     국내주식 매수가능금액 조회.
     ⚠️ 응답 필드명은 실행 후 실제 응답 구조로 재확인 필요 (추정치 사용 중).

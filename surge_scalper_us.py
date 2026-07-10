@@ -48,7 +48,7 @@ ENTRY_MIN_CHANGE    = 5.0          # 진입 최소 등락률(%, 전일종가 대
 ENTRY_MAX_CHANGE    = 12.0         # 진입 최대 등락률(%)
 MIN_PRICE           = 1.0          # $1 미만 제외(호가/LULD 정밀도 이슈 + 승률 애매)
 MAX_PRICE           = 20.0         # $20 초과 제외 (과거 $5~20 승률은 낮으니 로그 보고 조정)
-MIN_5MIN_DOLLAR_VOL = 100_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
+MIN_5MIN_DOLLAR_VOL = 5_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
 TAKE_PROFIT         = 5.0          # 익절(%)
 STOP_LOSS           = -3.0         # 손절(%)  ← 데이터가 지목한 유일한 교정 포인트
 TIME_EXIT_MIN       = 30           # 진입 후 N분 내 미도달 시 청산
@@ -57,14 +57,14 @@ SCREEN_INTERVAL     = 60           # 스크리닝 주기(초)
 MONITOR_INTERVAL    = 10           # 보유 종목 감시 주기(초)
 MOVERS_TOP          = 50           # Alpaca 급등 상위 몇 개까지 볼지
 MOST_ACTIVES_TOP    = 100          # 거래량 상위 몇 개를 초입 후보 풀로 볼지
-RECENT_MOVE_MIN     = 3.0          # 최근 5분 최소 상승폭(%) — "지금 움직이는 중"만 통과
-VOL_SURGE_MULT      = 3.0          # 초입: 최근 분당거래량 / 직전평균 배수
+RECENT_MOVE_MIN     = 2.0          # 최근 5분 최소 상승폭(%) — "지금 움직이는 중"만 통과
+VOL_SURGE_MULT      = 1.3          # 초입: 최근 분당거래량 / 직전평균 배수
 # ── 추격 모드 (이미 크게 오른 급등주에 올라타 아주 짧게) ──
 CHASE_ENABLED         = True
 CHASE_MIN_CHANGE      = 20.0       # 추격 최소 등락률(%)
 CHASE_MAX_CHANGE      = 120.0      # 추격 최대 등락률(%) — 이 이상은 상투라 제외
 CHASE_RECENT_MOVE_MIN = 0.5        # 추격: 최근 5분 여전히 상승 중이면 통과
-CHASE_VOL_SURGE_MULT  = 2.0        # 추격: 거래량 아직 살아있으면 통과
+CHASE_VOL_SURGE_MULT  = 1.2        # 추격: 거래량 아직 살아있으면 통과
 CHASE_TAKE_PROFIT     = 3.0        # 추격 익절(%) — 짧게
 CHASE_STOP_LOSS       = -2.0       # 추격 손절(%) — 타이트
 CHASE_TIME_EXIT_MIN   = 15         # 추격 시간청산(분) — 빠르게
@@ -384,6 +384,7 @@ def screen_and_enter(positions: dict):
     n_deep = 0
     n_buy = 0
     rejects = []
+    passed = []
     for mode, m in ordered:
         if len(positions) >= MAX_POSITIONS:
             break
@@ -400,6 +401,7 @@ def screen_and_enter(positions: dict):
         if not deep_check(sym, mode):
             rejects.append(f"{sym}({mode}·모멘텀)")
             continue
+        passed.append(f"{sym}({mode})")
 
         price = m["price"]
         try:
@@ -412,7 +414,14 @@ def screen_and_enter(positions: dict):
             log.info("예산 부족 스킵: %s budget=%.1f price=%.2f", sym, budget, price)
             continue
 
+        print(f"BUY TRY: {sym} exch={exch} qty={qty} price={price}")
         res = kis.place_order(sym, qty, price, "buy", session="regular", exchange=exch)
+        print("ORDER RESULT:", res)
+        print("ORDER RESULT:", res)
+
+        if res.get("rt_cd") != "0":
+            print("ORDER FAILED:", res)
+
         if res.get("rt_cd") == "0":
             positions[sym] = {
                 "entry_price": price,
@@ -425,9 +434,14 @@ def screen_and_enter(positions: dict):
             tag = "초입" if mode == "early" else "추격"
             notify(f"🟢 매수[{tag}] {sym} {qty}주 @${price:.2f} [{exch}] ({m['change_pct']:+.1f}%)")
             n_buy += 1
+        else:
+            log.warning("주문실패 %s [%s] rt_cd=%s msg=%s",
+                        sym, mode, res.get("rt_cd"), res.get("msg1"))
 
     msg = (f"스캔완료 후보={len(cands)} 초입={len(early)} 추격={len(chase)} "
-           f"매수={n_buy} 보유={len(positions)}/{MAX_POSITIONS}")
+           f"통과={len(passed)} 매수={n_buy} 보유={len(positions)}/{MAX_POSITIONS}")
+    if passed:
+        msg += " | 통과: " + ", ".join(passed[:8])
     if rejects:
         msg += " | 탈락: " + ", ".join(rejects[:5])
     log.info(msg)
