@@ -126,7 +126,7 @@ def get_exchange_code(symbol: str) -> str:
     return "NASD"   # TODO: 실제 거래소별 매핑 필요
 
 
-def place_order(symbol: str, qty: int, price: float, side: str, session: str = "regular") -> dict:
+def place_order(symbol: str, qty: int, price: float, side: str, session: str = "regular", exchange: str = None) -> dict:
     """
     해외주식 주문.
     side: "buy" 또는 "sell"
@@ -142,7 +142,8 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
     ord_dvsn = get_ord_dvsn_for_session(session)
 
     tr_id = TR_ID_ORDER_BUY if side == "buy" else TR_ID_ORDER_SELL
-    exchange = get_exchange_code(symbol)
+    if exchange is None:
+        exchange = get_exchange_code(symbol)
 
     body = {
         "CANO": CANO,
@@ -408,7 +409,26 @@ def get_kr_sellable_qty(code: str) -> int:
     return 0
 
 
-def get_domestic_buyable_amount(code: str, price: int) -> float:
+def get_kr_holding_qty(code: str) -> int:
+    """
+    국내주식 특정 종목의 실제 보유수량(hldg_qty) 조회.
+    매수 주문 직후 실제 체결수량을 확인하는 용도. 미보유/실패 시 0.
+    (ord_psbl_qty는 미체결 등으로 매도가능수량이 보유수량보다 작을 수 있어,
+     '지금 몇 주 갖고 있나'는 hldg_qty를 봐야 정확하다.)
+    """
+    try:
+        bal = get_domestic_balance()
+    except Exception as e:
+        print(f"[KIS 보유수량 조회 예외] {code} {e}")
+        return 0
+    for h in bal.get("output1", []):
+        if h.get("pdno") == code:
+            qty = h.get("hldg_qty") or 0
+            try:
+                return int(float(qty))
+            except (TypeError, ValueError):
+                return 0
+    return 0
     """
     국내주식 매수가능금액 조회.
     ⚠️ 응답 필드명은 실행 후 실제 응답 구조로 재확인 필요 (추정치 사용 중).
