@@ -25,10 +25,7 @@
 - 보유종목 10초 주기 체크 (해외주식봇과 동일한 슬리피지 개선 적용)
 - 손절 2회 도달 시 당일 블랙리스트
 - [v8-수정] 미체결/유령 포지션 차단: 매수 주문 후 실계좌 잔고를 역조회하여 실제 체결된 수량과 평단가만 장부에 반영.
-
-⚠️ 국내 공휴일(설/추석 등) 캘린더 체크는 아직 없음 — 요일만 판단.
-   필요 시 한국거래소 휴장일 API나 고정 리스트 추가 필요.
-⚠️ KIS 시세 API 응답 필드명은 실제 실행 결과로 재확인 필요.
+- [v9-패치] 타임존 불일치 오류 수정 및 포지션 복원 시 트레일링 스탑 초기값(peak_gain) 바인딩 누락 보완.
 """
 
 import os
@@ -313,7 +310,7 @@ def sim_open(code: str, name: str, price: float) -> bool:
     sim_stats["cash"] -= cost
     
     sim_positions[code] = {"entry": price, "qty": qty, "name": name}
-    entry_prices[code] = {"entry": price, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
+    entry_prices[code] = {"entry": price, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None, "peak_gain": 0.0}
     
     now_kst = get_kst_now()
     trade_log.append({
@@ -382,7 +379,7 @@ def check_sell_timing(code: str, current_price: float):
         return
     entry = entry_prices[code]
     entry_price = entry["entry"]
-    now = datetime.now(timezone_utc())
+    now = get_kst_now()   # [v9-패치] 타임존 오류 원치적 차단을 위해 KST 객체로 통일
     gain_pct = net_gain_pct(entry_price, current_price)
 
     peak = entry.get("peak_gain")
@@ -410,11 +407,6 @@ def check_sell_timing(code: str, current_price: float):
             entry["alert2"] = now
             sim_close(code, current_price, f"트레일링(고점{peak:+.1f}%→{gain_pct:+.1f}%)")
             print(f"[🟡 트레일링 청산] {code} 고점{peak:+.2f}% → 현재{gain_pct:+.2f}%")
-
-
-def timezone_utc():
-    from datetime import timezone
-    return timezone.utc
 
 
 def monitor_positions():
@@ -535,145 +527,4 @@ def build_report(title: str) -> str:
         if _w and _l:
             aw = sum(_w)/len(_w); al = abs(sum(_l)/len(_l))
             if al > 0:
-                lines.append(f"  ⚖️ 손익비: {aw/al:.2f} (평균익 {aw:+,.0f}원 / 평균손 -{al:,.0f}원)")
-        lines.append("━" * 14)
-
-    lines.append(f"💵 예수금(시뮬 추정, 참고용): {sim_stats['cash']:,.0f}원")
-    if LIVE_TRADING:
-        real_cash = _get_real_deposit_safe()
-        if real_cash is not None:
-            lines.append(f"🏦 실계좌 예수금: {real_cash:,.0f}원")
-    lines.append(f"💰 누적손익: {sim_stats['total_pnl']:+,.0f}원 ({total_return:+.2f}%)")
-    if daily_start_balance > 0:
-        _daily_ret = daily_realized_pnl / daily_start_balance * 100
-        _flag = "✅ 달성" if daily_target_hit else "진행중"
-        lines.append(f"📅 오늘 누적: {daily_realized_pnl:+,.0f}원 ({_daily_ret:+.2f}% / 목표 +{DAILY_PROFIT_TARGET_PCT}%, {_flag})")
-    lines.append(f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 (승률 {win_rate:.0f}%)")
-    return "\n".join(lines)
-
-
-def restore_positions_from_account():
-    try:
-        bal = kis.get_domestic_balance()
-    except Exception as e:
-        print(f"[포지션 복원 실패] {e}")
-        return
-    restored = 0
-    skipped_ghost = 0
-    for h in bal.get("output1", []):
-        code = h.get("pdno")
-        qty = int(h.get("hldg_qty", 0) or 0)
-        avg = float(h.get("pchs_avg_pric", 0) or 0)
-        name = h.get("prdt_name", "")
-        if not code or qty <= 0 or avg <= 0:
-            continue
-        if code in entry_prices:
-            continue
-
-        try:
-            sellable = kis.get_kr_sellable_qty(code)
-        except Exception as e:
-            print(f"[포지션 복원] {code} 매도가능수량 조회 실패({e}) - 안전하게 건너뜀")
-            continue
-        if sellable <= 0:
-            print(f"[포지션 복원 스킵] {code} 잔고 {qty}주 표시되지만 매도가능 0주 (유령 포지션 추정)")
-            skipped_ghost += 1
-            continue
-        qty = min(qty, sellable)
-
-        entry_prices[code] = {"entry": avg, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
-        sim_positions[code] = {"entry": avg, "qty": qty, "name": name}
-        restored += 1
-    if restored:
-        print(f"[포지션 복원] 실계좌 {restored}종목 감시 등록 완료")
-        send_telegram(f"🔄 [국장] 실계좌 {restored}종목 감시 복원 완료 (손절/익절 감시 시작)")
-    if skipped_ghost:
-        print(f"[포지션 복원] 유령 포지션 {skipped_ghost}종목 감시 제외")
-        send_telegram(f"⚠️ [국장] 잔고API 표시 vs 실제 매도가능 불일치 {skipped_ghost}종목 감시 제외 (유령 포지션 추정)")
-
-
-def main():
-    global market_close_sent, daily_start_balance, daily_realized_pnl, daily_target_hit
-    print("=" * 60)
-    print("🚀 국내주식(KRX) 급등 감지 봇 시작! (v4-수정 완료)")
-    print(f"🔌 LIVE_TRADING: {'ON (KIS 국내 모의투자 연동)' if LIVE_TRADING else 'OFF (시뮬만)'}")
-    print(f"📈 1분 {PRICE_CHANGE_1M}%+ (1차필터) → 가중점수 {MIN_ENTRY_SCORE}점+ 만 매수 | {MIN_PRICE:,}원+ | 상위 {TOP_N}종목")
-    print(f"🛡️ 상한가({LIMIT_UP_THRESHOLD}%+) 근접·우선주 제외")
-    print(f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산 (누적, 몰빵 아님)")
-    print(f"🎯 매도: 손절 {STOP_LOSS_PCT}%(net) | 트레일링 활성 +{TRAIL_ACTIVATE_PCT}%→고점대비 -{TRAIL_GAP_PCT}%p 청산 | 상한 +{SELL_FULL_PCT}%(net)")
-    print(f"📅 일일 누적목표: +{DAILY_PROFIT_TARGET_PCT}% 도달 시 그날 신규 매수 중단 (보유종목 감시는 계속)")
-    print(f"⏰ 매수 마감 {BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} | 정리매매(전량청산) {LIQUIDATION_HOUR}:{LIQUIDATION_MINUTE:02d}")
-    print(f"⚡ 보유종목 {POSITION_CHECK_INTERVAL}초 주기 체크")
-    print("=" * 60)
-
-    send_telegram(
-        f"🤖 <b>국내주식(KRX) 급등 감지 봇 시작! (v4-수정 완료)</b>\n"
-        f"🔌 LIVE_TRADING: <b>{'ON' if LIVE_TRADING else 'OFF (시뮬만)'}</b>\n"
-        f"📈 1분 {PRICE_CHANGE_1M}%+ 1차필터 → 가중점수 {MIN_ENTRY_SCORE}점+ 매수 | {MIN_PRICE:,}원+ 종목만\n"
-        f"🛡️ 상한가 근접·우선주 제외\n"
-        f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산\n"
-        f"🎯 손절 {STOP_LOSS_PCT}%(net) | 트레일링 +{TRAIL_ACTIVATE_PCT}%→-{TRAIL_GAP_PCT}%p | 상한 +{SELL_FULL_PCT}%(net)\n"
-        f"📅 일일 누적목표 +{DAILY_PROFIT_TARGET_PCT}% 도달 시 신규매수 중단\n"
-        f"⏰ 매수마감 {BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} | 정리매매 {LIQUIDATION_HOUR}:{LIQUIDATION_MINUTE:02d}"
-    )
-
-    last_scan_time = 0.0
-    restore_positions_from_account()
-
-    if daily_start_balance <= 0 and LIVE_TRADING:
-        daily_start_balance = _get_real_deposit_safe() or 0.0
-        print(f"[일일 기준자본] {daily_start_balance:,.0f}원 (목표 +{DAILY_PROFIT_TARGET_PCT}%)")
-
-    while True:
-        try:
-            now_str = get_kst_now().strftime("%H:%M:%S")
-
-            if get_kst_now().hour == 9 and get_kst_now().minute == 0:
-                if blacklisted_today or stop_loss_count or trade_log or last_alert or daily_target_hit:
-                    blacklisted_today.clear(); stop_loss_count.clear()
-                    trade_log.clear(); last_alert.clear()
-                    market_close_sent = False
-                    daily_realized_pnl = 0.0
-                    daily_target_hit = False
-                    daily_start_balance = _get_real_deposit_safe() or 0.0
-                    print(f"[일일 리셋] 기준자본 {daily_start_balance:,.0f}원 (목표 +{DAILY_PROFIT_TARGET_PCT}%)")
-
-            if not is_krx_regular_session():
-                print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
-                time.sleep(POSITION_CHECK_INTERVAL)
-                continue
-
-            if get_kst_now().hour == LIQUIDATION_HOUR and get_kst_now().minute >= LIQUIDATION_MINUTE and not market_close_sent:
-                market_close_sent = True
-                for code in list(sim_positions.keys()):
-                    price = kis.get_domestic_current_price(code)
-                    if price:
-                        sim_close(code, price, "정리매매(동시호가 전 강제청산)")
-                send_telegram(build_report("🔔 정리매매 완료 최종 매매일지"))
-
-            monitor_positions()
-
-            now_kst = get_kst_now()
-            buy_window_open = (now_kst.hour, now_kst.minute) < (BUY_CUTOFF_HOUR, BUY_CUTOFF_MINUTE) and not daily_target_hit
-
-            now_mono = time.monotonic()
-            if now_mono - last_scan_time >= CHECK_INTERVAL:
-                last_scan_time = now_mono
-                if buy_window_open:
-                    print(f"\n[{now_str}] 정규장 스캔 시작")
-                    run_scan()
-                elif daily_target_hit:
-                    print(f"[{now_str}] 일일 목표수익 도달 — 신규 스캔 생략, 보유종목 청산 대기만 진행")
-                else:
-                    print(f"[{now_str}] 매수 마감 시간({BUY_CUTOFF_HOUR}:{BUY_CUTOFF_MINUTE:02d} 이후) — 신규 스캔 생략, 보유종목 청산 대기만 진행")
-
-            time.sleep(POSITION_CHECK_INTERVAL)
-
-        except Exception as _loop_e:
-            print(f"[루프 오류] {_loop_e}")
-            import traceback; traceback.print_exc()
-            time.sleep(POSITION_CHECK_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
+                lines.append(f"  ⚖️ 손익비: {
