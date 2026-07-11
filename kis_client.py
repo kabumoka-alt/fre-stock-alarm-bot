@@ -50,13 +50,45 @@ TR_ID_DAY_BUY  = "TTTS6036U"   # 미국 주간거래 매수
 TR_ID_DAY_SELL = "TTTS6037U"   # 미국 주간거래 매도
 
 _token_cache = {"access_token": None, "expires_at": 0}
+_TOKEN_FILE = os.path.join(
+    os.path.expanduser("~"),
+    f".kis_token_cache_{'mock' if USE_MOCK else 'real'}.json",
+)
+
+
+def _load_token_file():
+    try:
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("access_token") and time.time() < d.get("expires_at", 0) - 300:
+            return d["access_token"], d["expires_at"]
+    except (FileNotFoundError, ValueError, KeyError):
+        pass
+    return None, 0
+
+
+def _save_token_file(token: str, expires_at: float):
+    try:
+        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"access_token": token, "expires_at": expires_at}, f)
+        os.chmod(_TOKEN_FILE, 0o600)
+    except OSError as e:
+        print(f"[KIS] 토큰 파일 저장 실패(무시하고 계속): {e}")
 
 
 def get_access_token() -> str:
-    """접근토큰 발급/캐싱. 만료 5분 전에 자동 갱신."""
+    """접근토큰 발급/캐싱. 메모리 → 파일 → 신규발급 순.
+    파일 캐시로 프로세스 간 재사용해 불필요한 재발급(403 rate limit) 방지."""
     now = time.time()
+
     if _token_cache["access_token"] and now < _token_cache["expires_at"] - 300:
         return _token_cache["access_token"]
+
+    tok, exp = _load_token_file()
+    if tok:
+        _token_cache["access_token"] = tok
+        _token_cache["expires_at"] = exp
+        return tok
 
     _throttle()
     resp = requests.post(
@@ -72,6 +104,7 @@ def get_access_token() -> str:
     data = resp.json()
     _token_cache["access_token"] = data["access_token"]
     _token_cache["expires_at"] = now + int(data.get("expires_in", 86400))
+    _save_token_file(_token_cache["access_token"], _token_cache["expires_at"])
     print(f"[KIS] 토큰 발급 완료 (만료: {data.get('expires_in')}초 후)")
     return _token_cache["access_token"]
 
