@@ -1,16 +1,23 @@
 """
-미국 주식 급등 감지 봇 v30 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v31 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
-- 매도 타이밍: +7% 1차(절반), +15% 전량, -10% 손절
+- 매도 타이밍: +7% 1차(절반) → 나머지는 트레일링 스톱으로 관리, -8% 손절
 - [v16] 텔레그램 알림 최소화: 매시 정각 중간 일지 / 장마감 최종 일지만 수신
 - [v17] ATR 기반 변동성 정렬: 상위 30종목 중 ATR 높은 순으로 재정렬 후 진입
-- [v18] 횡보 청산: 매수 후 10분 경과 & +3~+7% 구간 시 전량 청산
+- [v18] 횡보 청산: 매수 후 10분 경과 & +3~+6% 구간 시 전량 청산
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
 - [v25] 저가주 필터: $1 미만 종목 진입 제외
 - [v30] 예수금 배분 방식 변경: 30% 고정 → 남은 슬롯 균등 분배 (예수금 ÷ 남은 슬롯)
+- [v31] 손절 폭 조정 -10% → -8%, 폴링 60→30초 (슬리피지 축소)
+- [v31] 동시 보유 7 → 4 종목 (자본 집중)
+- [v31] 트레일링 스톱 도입: 고점 +TRAIL_ACTIVATE_PCT 이상에서 활성화,
+        고점 대비 -TRAIL_GAP_PCT%p 하락 시 청산 (기존 +15% 전량 대체 → 승자 태우기)
+- [v31] 횡보청산 완화: 트레일링 활성(고점≥활성임계) 종목은 횡보청산 면제
+- [v31] 일일 리스크 게이트: 당일 실현손익 +5% 도달 시 신규매수 중단(수익잠금),
+        -4% 도달 시 신규매수 중단(손실한도). 보유분 청산 로직은 계속 동작.
 """
 
 import os
@@ -30,21 +37,28 @@ PRICE_CHANGE_1M      = 3.0
 VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 기준
 MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
 
-CHECK_INTERVAL        = 60
+CHECK_INTERVAL        = 30   # [v31] 60 → 30초 (폴링 갭 축소로 손절 슬리피지 완화)
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
 MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
-MAX_POSITIONS         = 7    # [v29] 동시 보유 최대 종목 수
+MAX_POSITIONS         = 4    # [v31] 7 → 4 (자본 집중)
 
 # 매도 타이밍 임계값
 SELL_PARTIAL_PCT = 7.0
-SELL_FULL_PCT    = 15.0
-STOP_LOSS_PCT    = -10.0
+STOP_LOSS_PCT    = -8.0      # [v31] -10 → -8
+
+# [v31] 트레일링 스톱
+TRAIL_ACTIVATE_PCT = 6.0     # 고점이 +6% 이상 찍히면 트레일링 활성화
+TRAIL_GAP_PCT      = 4.0     # 고점 대비 -4%p 하락 시 청산 (마이크로캡 변동성 감안 넓게)
 
 # [v18] 횡보 청산 조건
 SIDEWAYS_MINUTES = 10
 SIDEWAYS_MIN_PCT = 3.0     # [v20] 횡보 구간 하한
-SIDEWAYS_MAX_PCT = 7.0     # [v20] 횡보 구간 상한 (+3~+7% 이내면 횡보 청산)
+SIDEWAYS_MAX_PCT = 6.0     # [v31] 상한을 트레일링 활성임계(6%)와 일치시켜 구간 겹침 제거
+
+# [v31] 일일 리스크 게이트
+DAILY_PROFIT_LOCK_PCT = 5.0   # 당일 실현손익 +5% 도달 시 신규매수 중단 (수익잠금)
+DAILY_LOSS_LIMIT_PCT  = -4.0  # 당일 실현손익 -4% 도달 시 신규매수 중단 (손실한도)
 
 HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_API_KEY,
@@ -71,6 +85,10 @@ sim_stats = {
     "wins":         0,
     "losses":       0,
 }
+
+# [v31] 일일 리스크 게이트 기준값 (장 시작 시 갱신)
+daily_start_pnl:  float = 0.0
+daily_start_cash: float = SIM_INITIAL_CASH
 
 # [v23] 종목당 손절 횟수 제한으로 전환
 # stop_loss_count[sym] = 당일 손절 횟수, MAX_STOP_LOSS_COUNT 도달 시 당일 블랙리스트
@@ -149,6 +167,27 @@ def is_regular_session() -> bool:
     if now_et.weekday() >= 5:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
+
+
+# ──────────────────────────────────────────
+# [v31] 일일 리스크 게이트
+# ──────────────────────────────────────────
+
+def daily_pnl_pct() -> float:
+    """당일 실현손익률(%) — 장 시작 자본 대비."""
+    if daily_start_cash <= 0:
+        return 0.0
+    return (sim_stats["total_pnl"] - daily_start_pnl) / daily_start_cash * 100
+
+
+def buys_allowed() -> tuple[bool, str]:
+    """신규매수 허용 여부 + 사유. 보유분 청산은 이 게이트와 무관하게 항상 동작."""
+    d = daily_pnl_pct()
+    if d >= DAILY_PROFIT_LOCK_PCT:
+        return False, f"수익잠금(당일 {d:+.1f}%)"
+    if d <= DAILY_LOSS_LIMIT_PCT:
+        return False, f"손실한도(당일 {d:+.1f}%)"
+    return True, ""
 
 
 # ──────────────────────────────────────────
@@ -244,6 +283,11 @@ def build_trade_report(title: str) -> str:
     if bl:
         lines.append(bl)
 
+    # [v31] 일일 게이트 상태 표시
+    ok, reason = buys_allowed()
+    if not ok:
+        lines.append(f"🔒 <b>신규매수 중단:</b> {reason}")
+
     lines.append("━━━━━━━━━━━━━━")
 
     pnl_sign = "+" if sim_stats["total_pnl"] >= 0 else ""
@@ -251,6 +295,7 @@ def build_trade_report(title: str) -> str:
         f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>",
         f"💰 누적 손익: <b>{pnl_sign}{sim_stats['total_pnl']:.2f}$</b> "
         f"(<b>{total_return_pct:+.2f}%</b>)",
+        f"📅 당일 실현손익: <b>{daily_pnl_pct():+.2f}%</b>",
         f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
         f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래",
     ]
@@ -296,7 +341,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     """
     포지션 청산.
     qty=None 이면 전량 청산.
-    손절(-4%) 시 블랙리스트 등록.
+    손절 시 블랙리스트 카운트 등록.
     반환값: 텔레그램 시뮬 요약 문자열.
     """
     pos = sim_positions.get(sym)
@@ -570,9 +615,13 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     entry       = entry_prices[sym]
     entry_price = entry["entry"]
     now_utc     = datetime.now(timezone.utc)
-    now_kst     = now_utc + timedelta(hours=9)
     gain_pct    = ((current_price - entry_price) / entry_price) * 100
     ticker_link = naver_link(sym)
+
+    # [v31] 고점(peak) 갱신 — 트레일링 스톱 기준
+    if gain_pct > entry.get("peak", 0.0):
+        entry["peak"] = gain_pct
+    peak = entry.get("peak", 0.0)
 
     def cooldown_ok(key):
         last = entry.get(key)
@@ -580,35 +629,24 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             return True
         return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
 
-    # ── 횡보 청산 (매수 후 10분 경과 & +3~+7% 미만) ──
-    elapsed_min = (now_utc - entry["time"]).total_seconds() / 60
-    if elapsed_min >= SIDEWAYS_MINUTES and not entry.get("sideways_done"):
-        if SIDEWAYS_MIN_PCT <= gain_pct < SIDEWAYS_MAX_PCT:
-            entry["sideways_done"] = True
-            if sym in sim_positions:
-                sim_close(sym, current_price, "횡보청산", qty=None)
-            print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
-            return
-
-    # ── 손절 ──
+    # ── 손절 (-8%) ──
     if gain_pct <= STOP_LOSS_PCT:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
             if sym in sim_positions:
-                sim_close(sym, current_price, "손절(-10%)", qty=None)
+                sim_close(sym, current_price, "손절(-8%)", qty=None)
             print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
-    # ── +15% 전량 매도 ──
-    if gain_pct >= SELL_FULL_PCT:
-        if cooldown_ok("alert2"):
-            entry["alert2"] = now_utc
-            if sym in sim_positions:
-                sim_close(sym, current_price, "+15% 전량", qty=None)
-            print(f"[🟢 전량매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+    # ── [v31] 트레일링 스톱 (고점 +6% 이상 활성화 & 고점 대비 -4%p 하락 시 전량 청산) ──
+    if peak >= TRAIL_ACTIVATE_PCT and gain_pct <= (peak - TRAIL_GAP_PCT):
+        if sym in sim_positions:
+            sim_close(sym, current_price, f"트레일링청산(고점{peak:+.1f}%)", qty=None)
+        print(f"[🟢 트레일링청산] {sym} | 고점 {peak:+.2f}% → 현재 {gain_pct:+.2f}% "
+              f"| ${entry_price:.2f} → ${current_price:.2f}")
         return
 
-    # ── +7% 1차 매도 ──
+    # ── +7% 1차 매도 (절반 확보). 나머지는 트레일링이 관리 ──
     if gain_pct >= SELL_PARTIAL_PCT:
         if cooldown_ok("alert1"):
             entry["alert1"] = now_utc
@@ -617,6 +655,20 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 half = max(1, pos["qty"] // 2)
                 sim_close(sym, current_price, "+7% 1차(절반)", qty=half)
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+        return
+
+    # ── [v31] 횡보 청산 완화: 트레일링 미활성(고점<활성임계) & 10분 경과 & +3~+6% 구간만 ──
+    elapsed_min = (now_utc - entry["time"]).total_seconds() / 60
+    if (peak < TRAIL_ACTIVATE_PCT
+            and elapsed_min >= SIDEWAYS_MINUTES
+            and not entry.get("sideways_done")):
+        if SIDEWAYS_MIN_PCT <= gain_pct < SIDEWAYS_MAX_PCT:
+            entry["sideways_done"] = True
+            if sym in sim_positions:
+                sim_close(sym, current_price, "횡보청산", qty=None)
+            print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} "
+                  f"({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
+            return
 
 
 # ──────────────────────────────────────────
@@ -762,6 +814,12 @@ def run_scan():
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
+    # [v31] 일일 리스크 게이트 확인 — 막혀 있으면 신규매수 스킵(보유분 관리는 위에서 이미 수행)
+    can_buy, lock_reason = buys_allowed()
+    if not can_buy:
+        print(f"  [🔒 신규매수 중단] {lock_reason} (당일 {daily_pnl_pct():+.2f}%) — 보유분 관리만 진행")
+        return
+
     # ATR 계산 후 높은 순으로 재정렬
     top_with_atr = []
     for stock in top:
@@ -796,8 +854,8 @@ def run_scan():
         last_alert[sym] = now_utc
         entry_prices[sym] = {
             "entry": stock["price"], "time": now_utc,
-            "alert1": None, "alert2": None, "stop": None,
-            "sideways_done": False,
+            "alert1": None, "stop": None,
+            "sideways_done": False, "peak": 0.0,   # [v31] peak 추적 추가
         }
 
         # 매수 제한 체크
@@ -821,25 +879,26 @@ def run_scan():
 # ──────────────────────────────────────────
 
 def main():
-    global market_close_sent
+    global market_close_sent, daily_start_pnl, daily_start_cash
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v30 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v31 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
-    print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
-    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
-    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
+    print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차(절반) | 트레일링(고점 +{TRAIL_ACTIVATE_PCT}% 활성, -{TRAIL_GAP_PCT}%p 갭) | {STOP_LOSS_PCT}% 손절")
+    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% (트레일링 미활성 종목만)")
+    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목 | 폴링 {CHECK_INTERVAL}초")
+    print(f"🔒 일일 게이트: +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도 (신규매수 중단)")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v30 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v31 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
-        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
-        f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
+        f"🎯 +{SELL_PARTIAL_PCT}% 1차(절반) → 트레일링(고점 +{TRAIL_ACTIVATE_PCT}%, -{TRAIL_GAP_PCT}%p) | {STOP_LOSS_PCT}% 손절\n"
+        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 폴링 {CHECK_INTERVAL}초\n"
+        f"🔒 당일 +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
-        f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
 
@@ -851,7 +910,11 @@ def main():
         if now_et.hour == 9 and now_et.minute < 30:
             if market_close_sent:
                 market_close_sent = False
-                print("[리셋] 장마감 플래그 초기화")
+                # [v31] 일일 리스크 게이트 기준 갱신 (장 시작 = 전량 청산 후라 예수금 = 자본)
+                daily_start_pnl  = sim_stats["total_pnl"]
+                daily_start_cash = sim_stats["cash"]
+                print(f"[리셋] 장마감 플래그 초기화 | 일일게이트 기준 갱신 "
+                      f"(기준자본 ${daily_start_cash:.2f})")
             if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
