@@ -48,7 +48,7 @@ ENTRY_MIN_CHANGE    = 5.0          # 진입 최소 등락률(%, 전일종가 대
 ENTRY_MAX_CHANGE    = 12.0         # 진입 최대 등락률(%)
 MIN_PRICE           = 1.0          # $1 미만 제외(호가/LULD 정밀도 이슈 + 승률 애매)
 MAX_PRICE           = 20.0         # $20 초과 제외 (과거 $5~20 승률은 낮으니 로그 보고 조정)
-MIN_5MIN_DOLLAR_VOL = 5_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
+MIN_5MIN_DOLLAR_VOL = 100_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
 TAKE_PROFIT         = 5.0          # 익절(%)
 STOP_LOSS           = -3.0         # 손절(%)  ← 데이터가 지목한 유일한 교정 포인트
 TIME_EXIT_MIN       = 30           # 진입 후 N분 내 미도달 시 청산
@@ -58,17 +58,38 @@ MONITOR_INTERVAL    = 10           # 보유 종목 감시 주기(초)
 PRICE_STALE_SEC     = 90           # 감시 가격이 이보다 오래되면 STALE 경고
 MOVERS_TOP          = 50           # Alpaca 급등 상위 몇 개까지 볼지
 MOST_ACTIVES_TOP    = 100          # 거래량 상위 몇 개를 초입 후보 풀로 볼지
-RECENT_MOVE_MIN     = 2.0          # 최근 5분 최소 상승폭(%) — "지금 움직이는 중"만 통과
-VOL_SURGE_MULT      = 1.3          # 초입: 최근 분당거래량 / 직전평균 배수
-# ── 추격 모드 (이미 크게 오른 급등주에 올라타 아주 짧게) ──
+RECENT_MOVE_MIN     = 3.0          # 최근 5분 최소 상승폭(%) — "지금 움직이는 중"만 통과
+VOL_SURGE_MULT      = 3.0          # 초입: 최근 분당거래량 / 직전평균 배수
+# ── 추격 = 3개 티어로 자본 분할 (같은 급등 후보풀, 서로 다른 필터/청산/예산) ──
 CHASE_ENABLED         = True
-CHASE_MIN_CHANGE      = 20.0       # 추격 최소 등락률(%)
-CHASE_MAX_CHANGE      = 120.0      # 추격 최대 등락률(%) — 이 이상은 상투라 제외
-CHASE_RECENT_MOVE_MIN = 0.5        # 추격: 최근 5분 여전히 상승 중이면 통과
-CHASE_VOL_SURGE_MULT  = 1.2        # 추격: 거래량 아직 살아있으면 통과
-CHASE_TAKE_PROFIT     = 3.0        # 추격 익절(%) — 짧게
-CHASE_STOP_LOSS       = -2.0       # 추격 손절(%) — 타이트
-CHASE_TIME_EXIT_MIN   = 15         # 추격 시간청산(분) — 빠르게
+CHASE_MIN_CHANGE      = 20.0       # 추격 후보 최소 등락률(%)
+CHASE_MAX_CHANGE      = 120.0      # 추격 후보 최대 등락률(%) — 이 이상은 상투라 제외
+
+# 티어A: 급상승 상위, "하락 중만 아니면" 매수 (거래량 조건 없음) — 예수금 30%
+TIER_A_BUDGET_PCT     = 0.30
+TIER_A_MAX_POS        = 1
+TIER_A_TP             = 20.0
+TIER_A_SL             = -3.0
+TIER_A_TIME_EXIT_MIN  = 15
+
+# 티어B: 기존 추격 로직 유지, 거래량 조건만 대폭 완화 — 예수금 60%
+TIER_B_BUDGET_PCT     = 0.60
+TIER_B_MAX_POS        = 2
+TIER_B_VOL_SURGE_MULT = 0.3        # 기존 2.0 → 0.3: 거래량이 크게 줄어도 통과
+TIER_B_TP             = 3.0
+TIER_B_SL             = -2.0
+TIER_B_TIME_EXIT_MIN  = 15
+
+# 티어C: 급상승 "1위"만, 시장가(대용 공격적 지정가), 트레일링 스톱 — 예수금 10%
+TIER_C_BUDGET_PCT        = 0.10
+TIER_C_MAX_POS           = 1
+TIER_C_INITIAL_SL        = -10.0   # 고점 형성 전(진입가 대비) 안전판 손절
+TIER_C_TRAIL_PCT         = 15.0    # 고점 대비 이만큼 빠지면 트레일링 청산
+TIER_C_MARKET_BUFFER_PCT = 5.0     # 시장가 대용: 매수 +5%/매도 -5% 공격적 지정가
+# TIER_C는 시간청산 없음 — 트레일링 하나로만 청산
+
+# 티어별 종목당 상한 예산(안전판, 실제는 이 값과 tier예산비율×매수가능액 중 작은 쪽)
+TIER_MAX_BUDGET_PER_TRADE = 500.0
 DEEP_CHECK_MAX      = 10           # 한 스캔에서 분봉까지 볼 후보 최대 수
 CLOSE_BUFFER_MIN    = 15           # 장 마감 N분 전엔 신규진입 중단 + 전량청산
 
@@ -252,11 +273,12 @@ def get_surge_candidates():
     return cands
 
 
+# 주문용 거래소코드(4글자) → 시세용 거래소코드(3글자)
 _EXCD_MAP = {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
 
 
 def _kis_price(symbol: str, exchange: str) -> float:
-    """한투 해외주식 실시간 현재가. 실패 시 0.0. (전체시장 + 실시간)"""
+    """한투 해외주식 실시간 현재가. 실패 시 0.0. (전체시장 데이터 + 실시간)"""
     try:
         excd = _EXCD_MAP.get(exchange, "NAS")
         kis._throttle()
@@ -293,11 +315,12 @@ def _iex_price(symbol: str):
 
 
 def get_monitor_price(symbol: str, exchange: str = "NASD"):
-    """감시용 현재가 + 데이터나이. 1순위 한투 실시간(age=0), 실패 시 IEX 폴백."""
+    """감시용 현재가 + 데이터 나이(초).
+    1순위 한투 실시간(age=0), 실패 시 IEX 폴백. (price, age_sec) 반환."""
     p = _kis_price(symbol, exchange)
     if p > 0:
-        return p, 0
-    return _iex_price(symbol)
+        return p, 0          # 한투는 실시간 → age 0
+    return _iex_price(symbol)  # 폴백
 
 
 # ─────────────────────────────────────────────
@@ -357,7 +380,8 @@ def classify(m: dict):
     return None
 
 
-def deep_check(symbol: str, mode: str = "early") -> bool:
+def deep_check(symbol: str) -> bool:
+    """초입(early) 전용 검증: 최근 급가속 + 거래량 폭발."""
     if symbol in NO_BARS:
         return False
     bars = get_recent_bars(symbol, limit=25)
@@ -367,20 +391,16 @@ def deep_check(symbol: str, mode: str = "early") -> bool:
     last5 = bars[-5:]
     closes = [b["c"] for b in last5]
 
-    # 상승 지속 & 페이드아웃 아님 (두 모드 공통)
     rising = closes[-1] > closes[0]
     not_fading = not (closes[-3] > closes[-2] > closes[-1])
     if not (rising and not_fading):
         return False
 
-    # 유동성 바닥 (두 모드 공통)
     dollar_vol = sum(b["v"] * b["c"] for b in last5)
     if dollar_vol < MIN_5MIN_DOLLAR_VOL:
         return False
 
     recent_move = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0
-
-    # 거래량 배수 (직전 평균 대비)
     recent_vol = sum(b["v"] for b in last5) / len(last5)
     prior = bars[:-5]
     vol_mult = None
@@ -388,100 +408,241 @@ def deep_check(symbol: str, mode: str = "early") -> bool:
         prior_vol = sum(b["v"] for b in prior) / len(prior)
         vol_mult = recent_vol / prior_vol if prior_vol > 0 else None
 
-    if mode == "chase":
-        # 이미 오른 걸 추격: 상승 유지 + 거래량 아직 살아있으면 OK
-        if recent_move < CHASE_RECENT_MOVE_MIN:
-            return False
-        if vol_mult is not None and vol_mult < CHASE_VOL_SURGE_MULT:
-            return False
-    else:
-        # 초입: 최근 급가속 + 거래량 폭발
-        if recent_move < RECENT_MOVE_MIN:
-            return False
-        if vol_mult is not None and vol_mult < VOL_SURGE_MULT:
+    if recent_move < RECENT_MOVE_MIN:
+        return False
+    if vol_mult is not None and vol_mult < VOL_SURGE_MULT:
+        return False
+    return True
+
+
+def _basic_bars(symbol: str, limit: int = 6):
+    """공용: 상승지속/페이드아웃 판정에 필요한 최소 분봉. bars 부족하면 None."""
+    if symbol in NO_BARS:
+        return None
+    bars = get_recent_bars(symbol, limit=limit)
+    if len(bars) < 6:
+        NO_BARS.add(symbol)
+        return None
+    return bars
+
+
+def passes_tier_a(symbol: str) -> bool:
+    """티어A: 하락 중(연속 페이드아웃)만 아니면 통과 — 거래량/유동성 조건 없음."""
+    bars = _basic_bars(symbol, limit=6)
+    if not bars:
+        return False
+    last5 = bars[-5:]
+    closes = [b["c"] for b in last5]
+    rising = closes[-1] > closes[0]
+    not_fading = not (closes[-3] > closes[-2] > closes[-1])
+    return rising and not_fading
+
+
+def passes_tier_b(symbol: str) -> bool:
+    """티어B: 기존 추격 로직 유지, 거래량 배수만 대폭 완화(TIER_B_VOL_SURGE_MULT)."""
+    bars = _basic_bars(symbol, limit=25)
+    if not bars:
+        return False
+    last5 = bars[-5:]
+    closes = [b["c"] for b in last5]
+    rising = closes[-1] > closes[0]
+    not_fading = not (closes[-3] > closes[-2] > closes[-1])
+    if not (rising and not_fading):
+        return False
+
+    dollar_vol = sum(b["v"] * b["c"] for b in last5)
+    if dollar_vol < MIN_5MIN_DOLLAR_VOL:
+        return False
+
+    recent_vol = sum(b["v"] for b in last5) / len(last5)
+    prior = bars[:-5]
+    if len(prior) >= 5:
+        prior_vol = sum(b["v"] for b in prior) / len(prior)
+        if prior_vol > 0 and recent_vol < prior_vol * TIER_B_VOL_SURGE_MULT:
             return False
     return True
 
 
+def get_rank1_candidate():
+    """오늘 등락률 1위 종목(가격 밴드 최소가만 체크, 상한 없음)."""
+    gainers = get_movers()
+    if not gainers:
+        return None
+    ranked = sorted(gainers, key=lambda x: x.get("change_pct", 0), reverse=True)
+    top = ranked[0]
+    if top.get("price", 0) < MIN_PRICE:
+        return None
+    return top
+
+
 # ─────────────────────────────────────────────
-# 진입 / 청산
+# 진입 / 청산 (early / 티어A / 티어B / 티어C)
 # ─────────────────────────────────────────────
+def tier_of_key(key: str) -> str:
+    """포지션 키 'SYM#TIER' → TIER. 접미사 없으면 'early'."""
+    return key.split("#", 1)[1] if "#" in key else "early"
+
+
+def symbol_of_key(key: str) -> str:
+    return key.split("#", 1)[0]
+
+
+def count_tier(positions: dict, tier: str) -> int:
+    return sum(1 for k in positions if tier_of_key(k) == tier)
+
+
+def place_aggressive(symbol, qty, price, side, exchange, buffer_pct):
+    """시장가 대용: 즉시체결 가능성이 높도록 버퍼를 크게 준 지정가.
+    (KIS 해외주식 진짜 시장가 지원 여부가 이 환경에서 미검증이라,
+     이미 검증된 지정가 주문 경로에 버퍼만 크게 얹는 방식으로 안전하게 구현)"""
+    if side == "buy":
+        adj = price * (1 + buffer_pct / 100)
+    else:
+        adj = price * (1 - buffer_pct / 100)
+    return kis.place_order(symbol, qty, adj, side, session="regular", exchange=exchange)
+
+
+def _tier_budget(symbol: str, price: float, tier_pct: float) -> float:
+    """티어 예산 = min(해당 종목 기준 매수가능액×티어비율, 안전상한)."""
+    try:
+        buyable = kis.get_buyable_amount(symbol, price)
+    except Exception:
+        buyable = 0.0
+    if buyable <= 0:
+        buyable = BUDGET_PER_POSITION  # 조회 실패 시 기존 안전값으로 폴백
+    return min(buyable * tier_pct, TIER_MAX_BUDGET_PER_TRADE)
+
+
+def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pct=None):
+    qty = int(budget // price)
+    if qty < 1:
+        log.info("예산 부족 스킵: %s[%s] budget=%.1f price=%.2f", sym, tier, budget, price)
+        return False
+    res = order_fn(sym, qty, price, exch)
+    if res.get("rt_cd") == "0":
+        key = f"{sym}#{tier}" if tier != "early" else sym
+        positions[key] = {
+            "symbol": sym,
+            "entry_price": price,
+            "peak_price": price,
+            "qty": qty,
+            "exchange": exch,
+            "mode": tier,
+            "entry_time": datetime.now().isoformat(),
+        }
+        save_positions(positions)
+        pct_str = f" ({change_pct:+.1f}%)" if change_pct is not None else ""
+        notify(f"🟢 매수[{tag}] {sym} {qty}주 @${price:.2f} [{exch}]{pct_str}")
+        return True
+    log.warning("주문실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
+    return False
+
+
 def screen_and_enter(positions: dict):
-    if len(positions) >= MAX_POSITIONS:
-        log.info("스캔 건너뜀 — 포지션 만석(%d/%d): %s",
-                 len(positions), MAX_POSITIONS, ", ".join(positions.keys()))
-        return
     cands = get_surge_candidates()
     if not cands:
         log.info("스캔 — 후보 0건")
         return
 
     early = [m for m in cands if classify(m) == "early"]
-    chase = [m for m in cands if classify(m) == "chase"]
-    # 초입 먼저 채우고, 빈 칸 있을 때만 추격
-    ordered = [("early", m) for m in early]
-    if CHASE_ENABLED:
-        ordered += [("chase", m) for m in chase]
+    chase = [m for m in cands if classify(m) == "chase"] if CHASE_ENABLED else []
 
-    n_deep = 0
     n_buy = 0
     rejects = []
     passed = []
-    for mode, m in ordered:
-        if len(positions) >= MAX_POSITIONS:
+
+    # ── 초입(early): 기존 그대로, 별도 슬롯(symbol 단독 키) ──
+    early_open = sum(1 for k in positions if tier_of_key(k) == "early")
+    for m in early:
+        if early_open >= MAX_POSITIONS:
             break
         sym = m.get("symbol")
         if not sym or sym in positions or sym in BLACKLIST:
             continue
-        if n_deep >= DEEP_CHECK_MAX:
-            break
-        n_deep += 1
         exch = get_kis_exchange(sym)
         if not exch:
             rejects.append(f"{sym}(거래소)")
             continue
-        if not deep_check(sym, mode):
-            rejects.append(f"{sym}({mode}·모멘텀)")
+        if not deep_check(sym):
+            rejects.append(f"{sym}(early·모멘텀)")
             continue
-        passed.append(f"{sym}({mode})")
-
+        passed.append(f"{sym}(early)")
         price = m["price"]
         try:
             buyable = kis.get_buyable_amount(sym, price)
         except Exception:
             buyable = 0.0
         budget = min(BUDGET_PER_POSITION, buyable) if buyable > 0 else BUDGET_PER_POSITION
-        qty = int(budget // price)
-        if qty < 1:
-            log.info("예산 부족 스킵: %s budget=%.1f price=%.2f", sym, budget, price)
-            continue
-
-        print(f"BUY TRY: {sym} exch={exch} qty={qty} price={price}")
-        res = kis.place_order(sym, qty, price, "buy", session="regular", exchange=exch)
-        print("ORDER RESULT:", res)
-        print("ORDER RESULT:", res)
-
-        if res.get("rt_cd") != "0":
-            print("ORDER FAILED:", res)
-
-        if res.get("rt_cd") == "0":
-            positions[sym] = {
-                "entry_price": price,
-                "qty": qty,
-                "exchange": exch,
-                "mode": mode,
-                "entry_time": datetime.now().isoformat(),
-            }
-            save_positions(positions)
-            tag = "초입" if mode == "early" else "추격"
-            notify(f"🟢 매수[{tag}] {sym} {qty}주 @${price:.2f} [{exch}] ({m['change_pct']:+.1f}%)")
+        if _try_buy(positions, sym, price, exch, "early", "초입", budget,
+                    lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
+                    change_pct=m.get("change_pct")):
+            early_open += 1
             n_buy += 1
-        else:
-            log.warning("주문실패 %s [%s] rt_cd=%s msg=%s",
-                        sym, mode, res.get("rt_cd"), res.get("msg1"))
+
+    # ── 티어A: 하락중만 아니면 매수, 예수금 30% ──
+    a_open = count_tier(positions, "A")
+    for m in chase:
+        if a_open >= TIER_A_MAX_POS:
+            break
+        sym = m.get("symbol")
+        key = f"{sym}#A"
+        if not sym or key in positions or key in BLACKLIST:
+            continue
+        exch = get_kis_exchange(sym)
+        if not exch:
+            continue
+        if not passes_tier_a(sym):
+            continue
+        price = m["price"]
+        budget = _tier_budget(sym, price, TIER_A_BUDGET_PCT)
+        if _try_buy(positions, sym, price, exch, "A", "추격A", budget,
+                    lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
+                    change_pct=m.get("change_pct")):
+            a_open += 1
+            n_buy += 1
+            break  # 한 번에 한 종목만 (슬롯 1)
+
+    # ── 티어B: 기존 추격 로직(거래량 완화), 예수금 60% ──
+    b_open = count_tier(positions, "B")
+    for m in chase:
+        if b_open >= TIER_B_MAX_POS:
+            break
+        sym = m.get("symbol")
+        key = f"{sym}#B"
+        if not sym or key in positions or key in BLACKLIST:
+            continue
+        exch = get_kis_exchange(sym)
+        if not exch:
+            continue
+        if not passes_tier_b(sym):
+            continue
+        price = m["price"]
+        budget = _tier_budget(sym, price, TIER_B_BUDGET_PCT)
+        if _try_buy(positions, sym, price, exch, "B", "추격B", budget,
+                    lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
+                    change_pct=m.get("change_pct")):
+            b_open += 1
+            n_buy += 1
+
+    # ── 티어C: 오늘 등락률 1위만, 시장가 대용, 예수금 10% ──
+    if count_tier(positions, "C") < TIER_C_MAX_POS:
+        top = get_rank1_candidate()
+        if top:
+            sym = top["symbol"]
+            key = f"{sym}#C"
+            if key not in positions and key not in BLACKLIST:
+                exch = get_kis_exchange(sym)
+                if exch and passes_tier_a(sym):   # 최소필터: 하락중만 아니면
+                    price = top["price"]
+                    budget = _tier_budget(sym, price, TIER_C_BUDGET_PCT)
+                    if _try_buy(positions, sym, price, exch, "C", "추격C(1위)", budget,
+                                lambda s, q, p, e: place_aggressive(
+                                    s, q, p, "buy", e, TIER_C_MARKET_BUFFER_PCT),
+                                change_pct=top.get("change_pct")):
+                        n_buy += 1
 
     msg = (f"스캔완료 후보={len(cands)} 초입={len(early)} 추격={len(chase)} "
-           f"통과={len(passed)} 매수={n_buy} 보유={len(positions)}/{MAX_POSITIONS}")
+           f"통과={len(passed)} 매수={n_buy} 보유={len(positions)}")
     if passed:
         msg += " | 통과: " + ", ".join(passed[:8])
     if rejects:
@@ -491,52 +652,75 @@ def screen_and_enter(positions: dict):
 
 def monitor_and_exit(positions: dict, force_all: bool = False):
     now = datetime.now()
-    for sym in list(positions.keys()):
-        p = positions[sym]
+    for key in list(positions.keys()):
+        p = positions[key]
+        sym = p.get("symbol", symbol_of_key(key))
+        tier = p.get("mode", tier_of_key(key))
+
         cur, age = get_monitor_price(sym, p.get("exchange", "NASD"))
         if cur <= 0:
-            log.warning("감시 %s: 가격조회 실패(0) — 손절 판단 불가", sym)
+            log.warning("감시 %s[%s]: 가격조회 실패(0) — 판단 불가", sym, tier)
             continue
+
+        # 티어C는 고점을 계속 추적 (트레일링 스톱의 기준)
+        if tier == "C":
+            p["peak_price"] = max(p.get("peak_price", p["entry_price"]), cur)
+            save_positions(positions)
+
         pnl = (cur - p["entry_price"]) / p["entry_price"] * 100
         held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
-
         stale = age is not None and age > PRICE_STALE_SEC
-        log.info("감시 %s pnl=%+.1f%% price=%.2f age=%ss%s",
-                 sym, pnl, cur, int(age) if age is not None else -1,
+        log.info("감시 %s[%s] pnl=%+.1f%% price=%.2f age=%ss%s",
+                 sym, tier, pnl, cur, int(age) if age is not None else -1,
                  " STALE" if stale else "")
-
-        mode = p.get("mode", "early")
-        if mode == "chase":
-            tp, sl, tmax = CHASE_TAKE_PROFIT, CHASE_STOP_LOSS, CHASE_TIME_EXIT_MIN
-        else:
-            tp, sl, tmax = TAKE_PROFIT, STOP_LOSS, TIME_EXIT_MIN
 
         reason = None
         if force_all:
             reason = "장마감 청산"
-        elif pnl >= tp:
-            reason = f"익절 +{pnl:.1f}%"
-        elif pnl <= sl:
-            reason = f"손절 {pnl:.1f}%"
-        elif held >= tmax:
-            reason = f"시간청산 {held:.0f}분 ({pnl:+.1f}%)"
+        elif tier == "C":
+            peak = p.get("peak_price", p["entry_price"])
+            if peak <= p["entry_price"] and pnl <= TIER_C_INITIAL_SL:
+                reason = f"손절(초기) {pnl:.1f}%"
+            else:
+                dd = (cur - peak) / peak * 100 if peak > 0 else 0
+                if dd <= -TIER_C_TRAIL_PCT:
+                    reason = f"트레일링청산 (고점대비{dd:.1f}%, 손익{pnl:+.1f}%)"
+            # 티어C는 시간청산 없음
+        else:
+            if tier == "A":
+                tp, sl, tmax = TIER_A_TP, TIER_A_SL, TIER_A_TIME_EXIT_MIN
+            elif tier == "B":
+                tp, sl, tmax = TIER_B_TP, TIER_B_SL, TIER_B_TIME_EXIT_MIN
+            else:  # early
+                tp, sl, tmax = TAKE_PROFIT, STOP_LOSS, TIME_EXIT_MIN
+            if pnl >= tp:
+                reason = f"익절 +{pnl:.1f}%"
+            elif pnl <= sl:
+                reason = f"손절 {pnl:.1f}%"
+            elif held >= tmax:
+                reason = f"시간청산 {held:.0f}분 ({pnl:+.1f}%)"
+
         if not reason:
             continue
 
         sellable = get_overseas_sellable_qty(sym)
-        # 잔고조회가 거래소차이 등으로 종목을 못 찾으면(0) 원장 수량으로 매도 시도(모의 검증 우선)
         sell_qty = min(p["qty"], sellable) if sellable > 0 else p["qty"]
         if sell_qty < 1:
-            log.warning("매도수량 0 → 스킵: %s", sym)
+            log.warning("매도수량 0 → 스킵: %s[%s]", sym, tier)
             continue
 
-        res = kis.place_order(sym, sell_qty, cur, "sell", session="regular", exchange=p.get("exchange"))
+        if tier == "C":
+            res = place_aggressive(sym, sell_qty, cur, "sell", p.get("exchange"),
+                                    TIER_C_MARKET_BUFFER_PCT)
+        else:
+            res = kis.place_order(sym, sell_qty, cur, "sell", session="regular",
+                                   exchange=p.get("exchange"))
         if res.get("rt_cd") == "0":
             emoji = "🔴" if pnl < 0 else "💰"
-            tag = "추격" if p.get("mode") == "chase" else "초입"
+            tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
             notify(f"{emoji} 매도[{tag}] {sym} {sell_qty}주 @${cur:.2f} — {reason}")
-            BLACKLIST.add(sym)
-            del positions[sym]
+            BLACKLIST.add(key)
+            del positions[key]
             save_positions(positions)
 
 
@@ -580,7 +764,7 @@ def main():
                 if time.time() - last_screen >= SCREEN_INTERVAL:
                     screen_and_enter(positions)
                     last_screen = time.time()
-                    if positions:
+                    if positions:          # 긴 스캔 직후 즉시 재감시 → 손절 지연 최소화
                         monitor_and_exit(positions)
 
             time.sleep(MONITOR_INTERVAL)
