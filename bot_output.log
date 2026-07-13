@@ -1,0 +1,4 @@
+  File "/home/ubuntu/fre-stock-alarm-bot/stock_pump_bot_kr.py", line 29
+    if __name__ == "__main__":
+    ^^
+IndentationError: expected an indented block after function definition on line 23
