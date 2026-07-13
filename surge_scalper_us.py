@@ -102,7 +102,19 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 STATE_FILE = os.path.expanduser("~/surge_scalper_us_positions.json")
-BLACKLIST  = set()
+BLACKLIST  = {}   # {key: 블랙리스트 등록시각} — 매도 후 REENTRY_COOLDOWN_MIN 지나면 자동 해제
+REENTRY_COOLDOWN_MIN = 60   # 같은 종목(같은 티어) 재진입 금지 시간(분)
+
+
+def is_blacklisted(key: str) -> bool:
+    """쿨다운이 지났으면 자동으로 블랙리스트에서 빼주고 False 반환."""
+    ts = BLACKLIST.get(key)
+    if ts is None:
+        return False
+    if (datetime.now() - ts).total_seconds() / 60 >= REENTRY_COOLDOWN_MIN:
+        del BLACKLIST[key]
+        return False
+    return True
 NO_BARS    = set()   # 분봉 없는 종목(워런트/특수) — 세션 내 재조회 스킵
 
 logging.basicConfig(
@@ -599,7 +611,7 @@ def screen_and_enter(positions: dict):
         if early_open >= MAX_POSITIONS:
             break
         sym = m.get("symbol")
-        if not sym or sym in positions or sym in BLACKLIST:
+        if not sym or sym in positions or is_blacklisted(sym):
             continue
         exch = get_kis_exchange(sym)
         if not exch:
@@ -628,7 +640,7 @@ def screen_and_enter(positions: dict):
             break
         sym = m.get("symbol")
         key = f"{sym}#A"
-        if not sym or key in positions or key in BLACKLIST:
+        if not sym or key in positions or is_blacklisted(key):
             continue
         exch = get_kis_exchange(sym)
         if not exch:
@@ -651,7 +663,7 @@ def screen_and_enter(positions: dict):
             break
         sym = m.get("symbol")
         key = f"{sym}#B"
-        if not sym or key in positions or key in BLACKLIST:
+        if not sym or key in positions or is_blacklisted(key):
             continue
         exch = get_kis_exchange(sym)
         if not exch:
@@ -672,7 +684,7 @@ def screen_and_enter(positions: dict):
         if top:
             sym = top["symbol"]
             key = f"{sym}#C"
-            if key not in positions and key not in BLACKLIST:
+            if key not in positions and not is_blacklisted(key):
                 exch = get_kis_exchange(sym)
                 if exch and passes_tier_a(sym):   # 최소필터: 하락중만 아니면
                     price = top["price"]
@@ -774,7 +786,7 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
 
         if remaining <= 0:
             notify(f"{emoji} 매도[{tag}] {sym} {sell_qty}주 @${cur:.2f} — {reason}")
-            BLACKLIST.add(key)
+            BLACKLIST[key] = datetime.now()
             del positions[key]
             save_positions(positions)
         else:
