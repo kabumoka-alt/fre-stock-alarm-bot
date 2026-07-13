@@ -360,6 +360,56 @@ def save_positions(pos: dict):
         json.dump(pos, f, ensure_ascii=False, indent=2)
 
 
+def sweep_orphan_positions(positions: dict):
+    """계좌 실잔고 vs 장부 대조 — 장부에 없는데 실제로 보유 중인 종목을
+    발견하면(예: 부분체결 버그 등으로 장부에서만 지워진 경우) 자동으로
+    다시 감시 대상에 편입시켜 방치되지 않게 한다. 봇 시작 시 1회 실행."""
+    try:
+        bal = kis.get_overseas_balance()
+    except Exception as e:
+        log.warning("고아포지션 점검 — 잔고조회 실패: %s", e)
+        return
+
+    tracked_symbols = {p.get("symbol", symbol_of_key(k)) for k, p in positions.items()}
+    adopted = []
+    for h in bal.get("output1", []):
+        sym = h.get("ovrs_pdno")
+        qty = h.get("ord_psbl_qty") or h.get("ovrs_cblc_qty") or 0
+        try:
+            qty = int(float(qty))
+        except (TypeError, ValueError):
+            qty = 0
+        if not sym or qty <= 0 or sym in tracked_symbols:
+            continue
+
+        # 장부에 없는데 실제로 들고 있는 종목 발견 — 티어B(보수적 설정)로 편입해
+        # 기존 monitor_and_exit 루프가 알아서 청산 시도하게 만든다.
+        exch = h.get("ovrs_excg_cd") or "NASD"
+        try:
+            avg_price = float(h.get("pchs_avg_pric") or 0)
+        except (TypeError, ValueError):
+            avg_price = 0.0
+        cur, _ = get_monitor_price(sym, exch)
+        entry_price = avg_price if avg_price > 0 else (cur if cur > 0 else 1.0)
+
+        key = f"{sym}#ORPHAN"
+        positions[key] = {
+            "symbol": sym,
+            "entry_price": entry_price,
+            "peak_price": entry_price,
+            "qty": qty,
+            "exchange": exch,
+            "mode": "B",   # 보수적 청산 기준(+3%/-2%/15분)으로 최대한 빨리 정리
+            "entry_time": datetime.now().isoformat(),
+        }
+        adopted.append(f"{sym}({qty}주)")
+
+    if adopted:
+        save_positions(positions)
+        notify("⚠️ 고아 포지션 발견 → 감시 편입: " + ", ".join(adopted))
+        log.warning("고아 포지션 편입: %s", adopted)
+
+
 # ─────────────────────────────────────────────
 # 후보 검증
 # ─────────────────────────────────────────────
@@ -715,13 +765,30 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         else:
             res = kis.place_order(sym, sell_qty, cur, "sell", session="regular",
                                    exchange=p.get("exchange"))
-        if res.get("rt_cd") == "0":
-            emoji = "🔴" if pnl < 0 else "💰"
-            tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
+        if res.get("rt_cd") != "0":
+            log.warning("매도주문 실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
+            continue
+
+        # ⚠️ 주문 접수(rt_cd=0)는 "체결 확정"이 아님 — 실제 잔고를 재조회해서
+        # 남은 수량이 진짜 0인지 확인한 뒤에만 장부에서 지운다.
+        # (부분체결 시 남은 수량을 장부에 남겨 계속 감시 → "유령 포지션" 방지)
+        remaining = get_overseas_sellable_qty(sym)
+        emoji = "🔴" if pnl < 0 else "💰"
+        tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
+
+        if remaining <= 0:
             notify(f"{emoji} 매도[{tag}] {sym} {sell_qty}주 @${cur:.2f} — {reason}")
             BLACKLIST.add(key)
             del positions[key]
             save_positions(positions)
+        else:
+            # 부분체결: 판 만큼만 알리고, 남은 수량은 장부에 유지해서 다음 틱에 재시도
+            sold = sell_qty - remaining
+            notify(f"{emoji} 매도[{tag}] {sym} {max(sold,0)}주 부분체결 @${cur:.2f} — {reason} "
+                   f"(잔여 {remaining}주 재시도 예정)")
+            p["qty"] = remaining
+            save_positions(positions)
+            log.warning("부분체결 감지 %s[%s]: 잔여 %d주 장부 유지", sym, tier, remaining)
 
 
 # ─────────────────────────────────────────────
@@ -729,25 +796,30 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
 # ─────────────────────────────────────────────
 def main():
     mode = "모의투자" if kis.USE_MOCK else "⚠️ 실전투자"
-    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}] 초입(+{TAKE_PROFIT}%/{STOP_LOSS}%) + 티어A(+{TIER_A_TP}%/{TIER_A_SL}%) + 티어B(+{TIER_B_TP}%/{TIER_B_SL}%) + 티어C(고점-{TIER_C_TRAIL_PCT}%)")
+    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}] 초입(+{TAKE_PROFIT}%/{STOP_LOSS}%) + "
+           f"티어A(+{TIER_A_TP}%/{TIER_A_SL}%) + 티어B(+{TIER_B_TP}%/{TIER_B_SL}%) + "
+           f"티어C(고점-{TIER_C_TRAIL_PCT}%)")
 
     positions = load_positions()
     if positions:
         notify(f"♻️ 기존 포지션 {len(positions)}건 복원: " + ", ".join(positions.keys()))
+    sweep_orphan_positions(positions)   # 장부에 없는데 실제 보유 중인 종목 정리(부분체결 등 대비)
 
     last_screen = 0.0
     was_open = False
-    force_close_announced = False
+    force_close_announced = False   # 마감임박 청산완료 알림 — 세션당 1회만
     while True:
         try:
             is_open, mins_to_close = get_clock()
 
+            # 개장 상태 변화 알림 (새 거래일 시작 시 마감알림 플래그도 리셋)
             if is_open and not was_open:
                 notify("🔔 미국장 개장 — 스캔 시작")
                 force_close_announced = False
             was_open = is_open
 
             if not is_open:
+                # 휴장/장외: 감시할 포지션만 남았으면 그대로 두고 대기
                 time.sleep(60)
                 continue
 
@@ -756,9 +828,11 @@ def main():
             if near_close and positions:
                 monitor_and_exit(positions, force_all=True)
                 if not positions and not force_close_announced:
+                    # 실제로 전량 청산이 끝난 순간에만, 세션당 딱 한 번 알림
                     notify("🏁 마감 임박 — 전량청산 완료")
                     force_close_announced = True
                 elif positions:
+                    # 매도가 안 먹혀서 아직 남아있으면 계속 재시도(알림은 스팸 안 되게 로그로만)
                     log.warning("마감임박 청산 재시도 중 — 남은 포지션: %s", list(positions.keys()))
 
             if positions:
