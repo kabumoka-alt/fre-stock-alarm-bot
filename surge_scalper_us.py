@@ -70,12 +70,10 @@ TIER_A_BUDGET_PCT     = 0.30
 TIER_A_MAX_POS        = 1
 TIER_A_TP             = 20.0
 TIER_A_SL             = -3.0
-TIER_A_TIME_EXIT_MIN  = 15
 
 # 티어B: 기존 추격 로직 유지, 거래량 조건만 대폭 완화 — 예수금 60%
 TIER_B_BUDGET_PCT     = 0.60
 TIER_B_MAX_POS        = 2
-TIER_B_VOL_SURGE_MULT = 0.3        # 기존 2.0 → 0.3: 거래량이 크게 줄어도 통과
 TIER_B_TP             = 3.0
 TIER_B_SL             = -2.0
 TIER_B_TIME_EXIT_MIN  = 15
@@ -489,8 +487,10 @@ def passes_tier_a(symbol: str) -> bool:
 
 
 def passes_tier_b(symbol: str) -> bool:
-    """티어B: 기존 추격 로직 유지, 거래량 배수만 대폭 완화(TIER_B_VOL_SURGE_MULT)."""
-    bars = _basic_bars(symbol, limit=25)
+    """티어B: 티어A(하락중만 아니면 통과)와 동일 + 유동성 안전판만 유지.
+    거래량 배수 조건은 제거(이미 튄 종목은 거래량이 식는 게 정상 패턴이라
+    이 조건이 진입 자체를 막아버리는 경우가 많았음 - 2026-07-13 데이터로 확인)."""
+    bars = _basic_bars(symbol, limit=6)
     if not bars:
         return False
     last5 = bars[-5:]
@@ -499,17 +499,9 @@ def passes_tier_b(symbol: str) -> bool:
     not_fading = not (closes[-3] > closes[-2] > closes[-1])
     if not (rising and not_fading):
         return False
-
     dollar_vol = sum(b["v"] * b["c"] for b in last5)
     if dollar_vol < MIN_5MIN_DOLLAR_VOL:
         return False
-
-    recent_vol = sum(b["v"] for b in last5) / len(last5)
-    prior = bars[:-5]
-    if len(prior) >= 5:
-        prior_vol = sum(b["v"] for b in prior) / len(prior)
-        if prior_vol > 0 and recent_vol < prior_vol * TIER_B_VOL_SURGE_MULT:
-            return False
     return True
 
 
@@ -736,10 +728,14 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
                 if dd <= -TIER_C_TRAIL_PCT:
                     reason = f"트레일링청산 (고점대비{dd:.1f}%, 손익{pnl:+.1f}%)"
             # 티어C는 시간청산 없음
+        elif tier == "A":
+            # 티어A: 시간청산 없음 — 익절/손절로만 청산
+            if pnl >= TIER_A_TP:
+                reason = f"익절 +{pnl:.1f}%"
+            elif pnl <= TIER_A_SL:
+                reason = f"손절 {pnl:.1f}%"
         else:
-            if tier == "A":
-                tp, sl, tmax = TIER_A_TP, TIER_A_SL, TIER_A_TIME_EXIT_MIN
-            elif tier == "B":
+            if tier == "B":
                 tp, sl, tmax = TIER_B_TP, TIER_B_SL, TIER_B_TIME_EXIT_MIN
             else:  # early
                 tp, sl, tmax = TAKE_PROFIT, STOP_LOSS, TIME_EXIT_MIN
