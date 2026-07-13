@@ -729,7 +729,7 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
 # ─────────────────────────────────────────────
 def main():
     mode = "모의투자" if kis.USE_MOCK else "⚠️ 실전투자"
-    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}] 초입(+{TAKE_PROFIT}%/{STOP_LOSS}%) + 추격(+{CHASE_TAKE_PROFIT}%/{CHASE_STOP_LOSS}%)")
+    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}] 초입(+{TAKE_PROFIT}%/{STOP_LOSS}%) + 티어A(+{TIER_A_TP}%/{TIER_A_SL}%) + 티어B(+{TIER_B_TP}%/{TIER_B_SL}%) + 티어C(고점-{TIER_C_TRAIL_PCT}%)")
 
     positions = load_positions()
     if positions:
