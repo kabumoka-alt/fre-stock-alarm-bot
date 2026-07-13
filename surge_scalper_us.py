@@ -737,17 +737,17 @@ def main():
 
     last_screen = 0.0
     was_open = False
+    force_close_announced = False
     while True:
         try:
             is_open, mins_to_close = get_clock()
 
-            # 개장 상태 변화 알림
             if is_open and not was_open:
                 notify("🔔 미국장 개장 — 스캔 시작")
+                force_close_announced = False
             was_open = is_open
 
             if not is_open:
-                # 휴장/장외: 감시할 포지션만 남았으면 그대로 두고 대기
                 time.sleep(60)
                 continue
 
@@ -755,7 +755,11 @@ def main():
 
             if near_close and positions:
                 monitor_and_exit(positions, force_all=True)
-                notify("🏁 마감 임박 — 전량청산 완료")
+                if not positions and not force_close_announced:
+                    notify("🏁 마감 임박 — 전량청산 완료")
+                    force_close_announced = True
+                elif positions:
+                    log.warning("마감임박 청산 재시도 중 — 남은 포지션: %s", list(positions.keys()))
 
             if positions:
                 monitor_and_exit(positions)
