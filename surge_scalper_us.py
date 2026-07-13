@@ -370,6 +370,75 @@ def save_positions(pos: dict):
         json.dump(pos, f, ensure_ascii=False, indent=2)
 
 
+# ─────────────────────────────────────────────
+# 일일 매매일지 (장마감 후 텔레그램 요약)
+# ─────────────────────────────────────────────
+def build_daily_report(since: "datetime") -> str:
+    """오늘 세션(since 이후) 로그에서 매도(청산) 기록만 뽑아 요약 리포트 생성."""
+    import re
+    from collections import defaultdict
+
+    try:
+        with open("surge_scalper_us.log", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"📊 일지 생성 실패(로그 읽기 오류): {e}"
+
+    trades = []  # (symbol, tier_tag, reason, pnl)
+    for line in lines:
+        ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),", line)
+        if not ts_match:
+            continue
+        try:
+            ts = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts < since:
+            continue
+        if "매도[" not in line:
+            continue
+        m = re.search(r"매도\[([^\]]+)\]\s+(\w+)", line)
+        if not m:
+            continue
+        tier_tag, sym = m.group(1), m.group(2)
+        pcts = re.findall(r"([+-]?\d+\.?\d*)%", line)
+        if not pcts:
+            continue
+        pnl = float(pcts[-1])   # 트레일링청산처럼 %가 여러개면 마지막(=실현손익)이 정답
+        reason_m = re.search(r"—\s*([^\n]+)", line)
+        reason = reason_m.group(1).strip() if reason_m else ""
+        trades.append((sym, tier_tag, reason, pnl))
+
+    if not trades:
+        return "📊 오늘의 매매일지 — 청산된 거래 없음"
+
+    by_tier = defaultdict(list)
+    for t in trades:
+        by_tier[t[1]].append(t)
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t[3] > 0)
+    avg = sum(t[3] for t in trades) / total
+    best = max(trades, key=lambda t: t[3])
+    worst = min(trades, key=lambda t: t[3])
+
+    lines_out = [
+        f"📊 오늘의 매매일지",
+        f"총 청산 {total}건 | 승률 {wins}/{total} ({wins/total*100:.0f}%) | 평균 {avg:+.2f}%",
+        "",
+    ]
+    for tier_tag, tl in by_tier.items():
+        w = sum(1 for t in tl if t[3] > 0)
+        a = sum(t[3] for t in tl) / len(tl)
+        lines_out.append(f"[{tier_tag}] {len(tl)}건 승{w}/{len(tl)} 평균{a:+.2f}%")
+
+    lines_out.append("")
+    lines_out.append(f"베스트: {best[0]} {best[3]:+.1f}%")
+    lines_out.append(f"워스트: {worst[0]} {worst[3]:+.1f}%")
+
+    return "\n".join(lines_out)
+
+
 def sweep_orphan_positions(positions: dict):
     """계좌 실잔고 vs 장부 대조 — 장부에 없는데 실제로 보유 중인 종목을
     발견하면(예: 부분체결 버그 등으로 장부에서만 지워진 경우) 자동으로
@@ -730,7 +799,7 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
 
         reason = None
         if force_all:
-            reason = "장마감 청산"
+            reason = f"장마감 청산 ({pnl:+.1f}%)"
         elif tier == "C":
             peak = p.get("peak_price", p["entry_price"])
             if peak <= p["entry_price"] and pnl <= TIER_C_INITIAL_SL:
@@ -816,14 +885,16 @@ def main():
     last_screen = 0.0
     was_open = False
     force_close_announced = False   # 마감임박 청산완료 알림 — 세션당 1회만
+    session_start = datetime.now()  # 오늘 매매일지 집계 시작 시각(개장 시 갱신)
     while True:
         try:
             is_open, mins_to_close = get_clock()
 
-            # 개장 상태 변화 알림 (새 거래일 시작 시 마감알림 플래그도 리셋)
+            # 개장 상태 변화 알림 (새 거래일 시작 시 마감알림 플래그/집계시작도 리셋)
             if is_open and not was_open:
                 notify("🔔 미국장 개장 — 스캔 시작")
                 force_close_announced = False
+                session_start = datetime.now()
             was_open = is_open
 
             if not is_open:
@@ -836,8 +907,9 @@ def main():
             if near_close and positions:
                 monitor_and_exit(positions, force_all=True)
                 if not positions and not force_close_announced:
-                    # 실제로 전량 청산이 끝난 순간에만, 세션당 딱 한 번 알림
+                    # 실제로 전량 청산이 끝난 순간에만, 세션당 딱 한 번 알림 + 일지 전송
                     notify("🏁 마감 임박 — 전량청산 완료")
+                    notify(build_daily_report(session_start))
                     force_close_announced = True
                 elif positions:
                     # 매도가 안 먹혀서 아직 남아있으면 계속 재시도(알림은 스팸 안 되게 로그로만)
