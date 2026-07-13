@@ -270,6 +270,27 @@ def is_preferred_stock(name: str) -> bool:
     return bool(re.search(r"\d*우[A-Z]?$", name or ""))
 
 
+# ETN/ETF/ETP/레버리지·인버스 등 파생상품 제외 키워드.
+# 이런 상품은 순수 급등 모멘텀이 아니라 기초지수 추종이라 1분 급등/RSI가 왜곡되고
+# (거래량 0.0x인데 RSI 100 같은 비정상 점수), 유동성도 들쭉날쭉해 스캘핑 대상 부적합.
+_DERIVATIVE_KEYWORDS = (
+    "ETN", "ETF", "ETP", "레버리지", "인버스", "TR ETN", "선물", "옵션",
+    "KODEX", "TIGER", "RISE", "PLUS", "SOL ", "ACE ", "KBSTAR", "ARIRANG",
+    "히어로즈", "TIMEFOLIO", "마이티", "WOORI", "KOSEF", "파워", "TOP10",
+)
+
+
+def is_derivative_product(name: str, code: str = "") -> bool:
+    """ETN/ETF/ETP 등 파생상품 여부 판별 → 스캘핑 대상에서 제외."""
+    nm = (name or "").upper()
+    if any(kw.upper() in nm for kw in _DERIVATIVE_KEYWORDS):
+        return True
+    # 종목코드가 알파벳으로 시작하면(예: Q530138) ETN 계열 → 제외
+    if code and not code[0].isdigit():
+        return True
+    return False
+
+
 # ──────────────────────────────────────────
 # 시뮬레이션 + KIS 실주문
 # ──────────────────────────────────────────
@@ -282,20 +303,29 @@ def sim_open(code: str, name: str, price: float) -> bool:
     remaining = max(MAX_POSITIONS - len(sim_positions), 1)  # 방어적 최소값 (0/음수 나눗셈 방지)
 
     if LIVE_TRADING:
-        # [v8] 예산 = 기준자본 / MAX_POSITIONS 로 슬롯당 고정 분할.
-        #      기존 real_buyable/remaining 방식은 직전 주문이 KIS 매수가능액에
-        #      즉시 반영되지 않아, 매 종목마다 "아직 현금 많음"으로 오판 → 예수금
-        #      초과 중복매수 → 부분체결 → 장부(요청수량)와 실체결 불일치 발생.
-        #      이제 슬롯 예산을 기준자본으로 고정하고, 실매수가능액과 비교해 작은 쪽 사용.
+        # [v10] 예산 = min(슬롯예산, 실제 남은 현금).
+        #   기존 get_domestic_buyable_amount()는 미체결 주문이 예수금을 잡고 있으면
+        #   0을 반환해 매수가 막히거나, 반대로 직전주문 미반영 시 과다 산정됐다.
+        #   이제 잔고조회의 예수금(dnca_tot_amt)에서 금일 매수금액합계(pchs_amt_smtl_amt)를
+        #   직접 빼서 "실제 지금 쓸 수 있는 현금"을 계산한다. 미체결·부분체결이
+        #   pchs_amt_smtl_amt에 반영되므로 예수금 초과 중복매수가 원천 차단된다.
         if daily_start_balance <= 0:
             print(f"  [매수 불가] {code} 기준자본 미확정 (일일 기준자본 0)")
             return False
-        slot_budget = daily_start_balance / MAX_POSITIONS
-        real_buyable = kis.get_domestic_buyable_amount(code, int(price))
-        if real_buyable <= 0:
-            print(f"  [매수 불가] {code} KIS 매수가능금액 조회 실패/0")
+        try:
+            _bal = kis.get_domestic_balance()
+            _o2 = (_bal.get("output2") or [{}])[0]
+            _deposit = float(_o2.get("dnca_tot_amt", 0) or 0)          # 예수금
+            _already_bought = float(_o2.get("pchs_amt_smtl_amt", 0) or 0)  # 금일 매수금액합계
+        except Exception as e:
+            print(f"  [매수 불가] {code} 잔고조회 실패({e})")
             return False
-        budget = min(slot_budget, real_buyable)
+        real_cash = _deposit - _already_bought   # 실제 남은 주문가능 현금(근사)
+        if real_cash < price:
+            print(f"  [매수 불가] {code} 잔여현금 부족 (예수금 {_deposit:,.0f} - 매수 {_already_bought:,.0f} = {real_cash:,.0f}, 1주 {price:,.0f})")
+            return False
+        slot_budget = daily_start_balance / MAX_POSITIONS
+        budget = min(slot_budget, real_cash)
     else:
         budget = sim_stats["cash"] / remaining
 
@@ -489,6 +519,8 @@ def run_scan():
             continue
         if is_preferred_stock(stock.get("name", "")):
             continue  # [v2] 우선주 제외
+        if is_derivative_product(stock.get("name", ""), code):
+            continue  # [v9] ETN/ETF/레버리지 등 파생상품 제외 (모멘텀 왜곡·유동성 문제)
         if stock.get("change_pct", 0) >= LIMIT_UP_THRESHOLD:
             continue  # [v2] 상한가 근접 제외 (더 못 먹고 급락 리스크만 남은 구간)
         if code in last_alert:
