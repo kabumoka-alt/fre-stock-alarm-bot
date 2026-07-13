@@ -55,6 +55,7 @@ TIME_EXIT_MIN       = 30           # 진입 후 N분 내 미도달 시 청산
 
 SCREEN_INTERVAL     = 60           # 스크리닝 주기(초)
 MONITOR_INTERVAL    = 10           # 보유 종목 감시 주기(초)
+PRICE_STALE_SEC     = 90           # 감시 가격이 이보다 오래되면 STALE 경고
 MOVERS_TOP          = 50           # Alpaca 급등 상위 몇 개까지 볼지
 MOST_ACTIVES_TOP    = 100          # 거래량 상위 몇 개를 초입 후보 풀로 볼지
 RECENT_MOVE_MIN     = 2.0          # 최근 5분 최소 상승폭(%) — "지금 움직이는 중"만 통과
@@ -83,6 +84,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 STATE_FILE = os.path.expanduser("~/surge_scalper_us_positions.json")
 BLACKLIST  = set()
+NO_BARS    = set()   # 분봉 없는 종목(워런트/특수) — 세션 내 재조회 스킵
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,7 +180,7 @@ def get_recent_bars(symbol: str, limit: int = 6):
             timeout=8,
         )
         r.raise_for_status()
-        bars = r.json().get("bars", [])
+        bars = r.json().get("bars") or []
         return [{"c": float(b["c"]), "v": float(b["v"])} for b in bars]
     except Exception as e:
         log.warning("분봉 조회 실패 %s: %s", symbol, e)
@@ -250,15 +252,52 @@ def get_surge_candidates():
     return cands
 
 
-def get_last_price(symbol: str) -> float:
-    """최신 체결가 (감시용)"""
+_EXCD_MAP = {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
+
+
+def _kis_price(symbol: str, exchange: str) -> float:
+    """한투 해외주식 실시간 현재가. 실패 시 0.0. (전체시장 + 실시간)"""
+    try:
+        excd = _EXCD_MAP.get(exchange, "NAS")
+        kis._throttle()
+        r = requests.get(
+            f"{kis.BASE_URL}/uapi/overseas-price/v1/quotations/price",
+            headers=kis._headers("HHDFS00000300"),
+            params={"AUTH": "", "EXCD": excd, "SYMB": symbol}, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("rt_cd") == "0":
+            return float(d.get("output", {}).get("last", 0) or 0)
+    except Exception as e:
+        log.warning("한투 시세 실패 %s: %s", symbol, e)
+    return 0.0
+
+
+def _iex_price(symbol: str):
+    """IEX 최신체결가 폴백. (price, age_sec)."""
     try:
         r = requests.get(f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/trades/latest",
                          headers=ALPACA_HDR, params={"feed": "iex"}, timeout=8)
         r.raise_for_status()
-        return float(r.json().get("trade", {}).get("p", 0))
+        tr = r.json().get("trade") or {}
+        price = float(tr.get("p", 0) or 0)
+        age = None
+        ts = tr.get("t")
+        if ts:
+            from datetime import timezone
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - t).total_seconds()
+        return price, age
     except Exception:
-        return 0.0
+        return 0.0, None
+
+
+def get_monitor_price(symbol: str, exchange: str = "NASD"):
+    """감시용 현재가 + 데이터나이. 1순위 한투 실시간(age=0), 실패 시 IEX 폴백."""
+    p = _kis_price(symbol, exchange)
+    if p > 0:
+        return p, 0
+    return _iex_price(symbol)
 
 
 # ─────────────────────────────────────────────
@@ -319,8 +358,11 @@ def classify(m: dict):
 
 
 def deep_check(symbol: str, mode: str = "early") -> bool:
+    if symbol in NO_BARS:
+        return False
     bars = get_recent_bars(symbol, limit=25)
     if len(bars) < 6:
+        NO_BARS.add(symbol)
         return False
     last5 = bars[-5:]
     closes = [b["c"] for b in last5]
@@ -451,11 +493,17 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
     now = datetime.now()
     for sym in list(positions.keys()):
         p = positions[sym]
-        cur = get_last_price(sym)
+        cur, age = get_monitor_price(sym, p.get("exchange", "NASD"))
         if cur <= 0:
+            log.warning("감시 %s: 가격조회 실패(0) — 손절 판단 불가", sym)
             continue
         pnl = (cur - p["entry_price"]) / p["entry_price"] * 100
         held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
+
+        stale = age is not None and age > PRICE_STALE_SEC
+        log.info("감시 %s pnl=%+.1f%% price=%.2f age=%ss%s",
+                 sym, pnl, cur, int(age) if age is not None else -1,
+                 " STALE" if stale else "")
 
         mode = p.get("mode", "early")
         if mode == "chase":
@@ -532,6 +580,8 @@ def main():
                 if time.time() - last_screen >= SCREEN_INTERVAL:
                     screen_and_enter(positions)
                     last_screen = time.time()
+                    if positions:
+                        monitor_and_exit(positions)
 
             time.sleep(MONITOR_INTERVAL)
 
