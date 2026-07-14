@@ -48,7 +48,7 @@ ENTRY_MIN_CHANGE    = 5.0          # 진입 최소 등락률(%, 전일종가 대
 ENTRY_MAX_CHANGE    = 12.0         # 진입 최대 등락률(%)
 MIN_PRICE           = 1.0          # $1 미만 제외(호가/LULD 정밀도 이슈 + 승률 애매)
 MAX_PRICE           = 20.0         # $20 초과 제외 (과거 $5~20 승률은 낮으니 로그 보고 조정)
-MIN_5MIN_DOLLAR_VOL = 100_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
+MIN_5MIN_DOLLAR_VOL = 5_000.0      # 최근 5분 거래대금 하한(USD) — IEX 저평가 감안
 TAKE_PROFIT         = 5.0          # (미사용, 초입은 부분익절+트레일링으로 대체됨 — 하위호환 위해 남겨둠)
 STOP_LOSS           = -3.0         # (미사용, 아래 EARLY_STOP_LOSS_V2로 대체됨)
 TIME_EXIT_MIN       = 30           # (미사용, 초입은 시간청산 없이 부분익절+트레일링으로 청산)
@@ -543,8 +543,21 @@ def in_price_band(m: dict) -> bool:
     return MIN_PRICE <= p <= MAX_PRICE
 
 
+def is_warrant(sym: str) -> bool:
+    """워런트/유닛 등 파생 티커 판별 (v31 이식)."""
+    s2 = sym.upper()
+    if any(suffix in s2 for suffix in (".WS", ".WT", ".U", ".UN", ".RT", ".R")):
+        return True
+    if len(s2) >= 5 and s2.endswith("W") and "." not in s2:
+        return True
+    return False
+
+
 def classify(m: dict):
     """진입 모드 판정 → 'early' | 'chase' | None"""
+    sym = m.get("symbol", "")
+    if sym and is_warrant(sym):
+        return None
     if not in_price_band(m):
         return None
     c = m.get("change_pct", 0.0)
