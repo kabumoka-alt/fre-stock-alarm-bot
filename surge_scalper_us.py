@@ -946,9 +946,11 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
 # ─────────────────────────────────────────────
 def main():
     mode = "모의투자" if kis.USE_MOCK else "⚠️ 실전투자"
-    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}] 초입(+{TAKE_PROFIT}%/{STOP_LOSS}%) + "
-           f"티어A(+{TIER_A_TP}%/{TIER_A_SL}%) + 티어B(+{TIER_B_TP}%/{TIER_B_SL}%) + "
-           f"티어C(고점-{TIER_C_TRAIL_PCT}%)")
+    notify(f"🚀 미장 급등주 스캘퍼 시작 [{mode}]\n"
+           f"초입: {EARLY_PARTIAL_PCT:.0f}%절반익절→고점+{EARLY_TRAIL_ACTIVATE:.0f}%트레일링(-{EARLY_TRAIL_GAP:.0f}%p) / 손절{EARLY_STOP_LOSS_V2:.0f}%\n"
+           f"티어A: {TIER_A_PARTIAL_PCT:.0f}%절반익절→고점+{TIER_A_TRAIL_ACTIVATE:.0f}%트레일링(-{TIER_A_TRAIL_GAP:.0f}%p) / 손절{TIER_A_SL:.0f}%\n"
+           f"티어B: +{TIER_B_TP:.0f}%/{TIER_B_SL:.0f}%/{TIER_B_TIME_EXIT_MIN}분 | 티어C: 고점-{TIER_C_TRAIL_PCT:.0f}%\n"
+           f"일일게이트: +{DAILY_PROFIT_LOCK_PCT:.0f}%수익잠금 / {DAILY_LOSS_LIMIT_PCT:.0f}%손실한도")
 
     positions = load_positions()
     if positions:
