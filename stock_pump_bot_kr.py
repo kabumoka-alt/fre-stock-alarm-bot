@@ -131,9 +131,15 @@ last_hourly_report: int = -1
 market_close_sent = False
 
 # [v6] 일일 누적 수익목표 추적 (매일 9:00에 리셋)
-daily_start_balance: float = 0.0   # 그날 시작 시점 실계좌 예수금 (기준 자본)
-daily_realized_pnl: float = 0.0    # 그날 실현손익 누적
+daily_start_balance: float = 0.0   # 그날 시작 시점 실계좌 예수금 (기준 자본, 리포트용)
+daily_realized_pnl: float = 0.0    # [v11] 그날 '신규진입 종목'의 실현손익만 누적 (이월종목 제외)
 daily_target_hit: bool = False     # 목표 도달 시 True → 신규 매수 중단
+
+# [v11] 6% 목표는 "당일 신규 진입 종목의 매매 손익"만으로 판단한다.
+#   어제 넘어온(복원된) 이월 종목을 오늘 정리해서 난 손익은 제외 —
+#   안 그러면 이월종목 익절만으로 개장 직후 목표가 조기 달성되는 문제 발생.
+opened_today: set = set()          # 오늘 이 봇이 신규 매수한 종목코드
+daily_entry_cost: float = 0.0      # 오늘 신규 진입에 투입한 원금 합계 (수익률 분모)
 
 
 # ──────────────────────────────────────────
@@ -296,6 +302,7 @@ def is_derivative_product(name: str, code: str = "") -> bool:
 # ──────────────────────────────────────────
 
 def sim_open(code: str, name: str, price: float) -> bool:
+    global daily_entry_cost
     if code in sim_positions or code in blacklisted_today:
         return False
     if len(sim_positions) >= MAX_POSITIONS:
@@ -359,6 +366,8 @@ def sim_open(code: str, name: str, price: float) -> bool:
     cost = net_entry_cost(price) * filled_qty
     sim_stats["cash"] -= cost
     sim_positions[code] = {"entry": price, "qty": filled_qty, "name": name}
+    opened_today.add(code)          # [v11] 오늘 신규 진입 종목으로 표시
+    daily_entry_cost += cost        # [v11] 당일 수익률 계산의 분모(투입원금)
     now_kst = get_kst_now()
     trade_log.append({"action": "BUY", "sym": code, "name": name, "qty": filled_qty, "price": price,
                        "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수", "time_kst": now_kst.strftime("%H:%M")})
@@ -417,18 +426,21 @@ def sim_close(code: str, exit_price: float, reason: str, qty: int = None):
     else:
         sim_stats["total_pnl"] += pnl
 
-    # [v6] 일일 누적 수익목표 체크 (실현손익 기준)
-    daily_realized_pnl += pnl
-    if not daily_target_hit and daily_start_balance > 0:
-        daily_ret_pct = daily_realized_pnl / daily_start_balance * 100
-        if daily_ret_pct >= DAILY_PROFIT_TARGET_PCT:
-            daily_target_hit = True
-            print(f"[🎯 일일 목표 도달] 누적 {daily_ret_pct:+.2f}% ≥ {DAILY_PROFIT_TARGET_PCT}% — 오늘 신규 매수 중단")
-            send_telegram(
-                f"🎯 <b>일일 목표수익률 {DAILY_PROFIT_TARGET_PCT}% 도달!</b>\n"
-                f"오늘 실현손익 {daily_realized_pnl:+,.0f}원 ({daily_ret_pct:+.2f}%)\n"
-                f"오늘은 신규 매수를 중단합니다 (보유종목 매도/손절 감시는 계속 진행)."
-            )
+    # [v11] 일일 목표는 '오늘 신규 진입한 종목'의 매도 손익만 집계.
+    #   어제 넘어온 이월 종목(opened_today에 없음)을 오늘 정리해 난 손익은 제외한다.
+    if code in opened_today:
+        daily_realized_pnl += pnl
+        if not daily_target_hit and daily_entry_cost > 0:
+            daily_ret_pct = daily_realized_pnl / daily_entry_cost * 100  # 당일 투입원금 대비
+            if daily_ret_pct >= DAILY_PROFIT_TARGET_PCT:
+                daily_target_hit = True
+                print(f"[🎯 일일 목표 도달] 당일매매 순익 {daily_ret_pct:+.2f}% ≥ {DAILY_PROFIT_TARGET_PCT}% — 오늘 신규 매수 중단")
+                send_telegram(
+                    f"🎯 <b>당일매매 순익 {DAILY_PROFIT_TARGET_PCT}% 도달!</b>\n"
+                    f"오늘 신규매매 실현손익 {daily_realized_pnl:+,.0f}원 "
+                    f"(투입 {daily_entry_cost:,.0f}원 대비 {daily_ret_pct:+.2f}%)\n"
+                    f"오늘은 신규 매수를 중단합니다 (보유종목 매도/손절 감시는 계속 진행)."
+                )
 
     if "손절" in reason:
         stop_loss_count[code] = stop_loss_count.get(code, 0) + 1
@@ -624,10 +636,12 @@ def build_report(title: str) -> str:
         if real_cash is not None:
             lines.append(f"🏦 실계좌 예수금: {real_cash:,.0f}원")
     lines.append(f"💰 누적손익: {sim_stats['total_pnl']:+,.0f}원 ({total_return:+.2f}%)")
-    if daily_start_balance > 0:
-        _daily_ret = daily_realized_pnl / daily_start_balance * 100
+    if daily_entry_cost > 0:
+        _daily_ret = daily_realized_pnl / daily_entry_cost * 100
         _flag = "✅ 달성" if daily_target_hit else "진행중"
-        lines.append(f"📅 오늘 누적: {daily_realized_pnl:+,.0f}원 ({_daily_ret:+.2f}% / 목표 +{DAILY_PROFIT_TARGET_PCT}%, {_flag})")
+        lines.append(f"📅 당일매매 순익: {daily_realized_pnl:+,.0f}원 (투입 {daily_entry_cost:,.0f}원 대비 {_daily_ret:+.2f}% / 목표 +{DAILY_PROFIT_TARGET_PCT}%, {_flag})")
+    else:
+        lines.append(f"📅 당일매매 순익: 신규 진입·청산 완료 건 없음")
     lines.append(f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 (승률 {win_rate:.0f}%)")
     return "\n".join(lines)
 
@@ -683,7 +697,7 @@ def restore_positions_from_account():
 
 
 def main():
-    global market_close_sent, daily_start_balance, daily_realized_pnl, daily_target_hit
+    global market_close_sent, daily_start_balance, daily_realized_pnl, daily_target_hit, daily_entry_cost
     print("=" * 60)
     print("🚀 국내주식(KRX) 급등 감지 봇 시작! (v4)")
     print(f"🔌 LIVE_TRADING: {'ON (KIS 국내 모의투자 연동)' if LIVE_TRADING else 'OFF (시뮬만)'}")
@@ -721,14 +735,16 @@ def main():
             now_str = get_kst_now().strftime("%H:%M:%S")
 
             if get_kst_now().hour == 9 and get_kst_now().minute == 0:
-                if blacklisted_today or stop_loss_count or trade_log or last_alert or daily_target_hit:
+                if blacklisted_today or stop_loss_count or trade_log or last_alert or daily_target_hit or opened_today:
                     blacklisted_today.clear(); stop_loss_count.clear()
                     trade_log.clear(); last_alert.clear()
+                    opened_today.clear()          # [v11] 당일 진입종목 초기화
+                    daily_entry_cost = 0.0        # [v11] 당일 투입원금 초기화
                     market_close_sent = False
                     daily_realized_pnl = 0.0
                     daily_target_hit = False
                     daily_start_balance = _get_real_deposit_safe() or 0.0
-                    print(f"[일일 리셋] 기준자본 {daily_start_balance:,.0f}원 (목표 +{DAILY_PROFIT_TARGET_PCT}%)")
+                    print(f"[일일 리셋] 기준자본 {daily_start_balance:,.0f}원 (목표 당일매매 +{DAILY_PROFIT_TARGET_PCT}%)")
 
             if not is_krx_regular_session():
                 print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
