@@ -99,6 +99,7 @@ TIER_C_MAX_POS           = 1
 TIER_C_INITIAL_SL        = -10.0   # 고점 형성 전(진입가 대비) 안전판 손절
 TIER_C_TRAIL_PCT         = 15.0    # 고점 대비 이만큼 빠지면 트레일링 청산
 TIER_C_MARKET_BUFFER_PCT = 5.0     # 시장가 대용: 매수 +5%/매도 -5% 공격적 지정가
+EXIT_SELL_BUFFER_PCT     = 3.0     # 초입/티어A/B 전량매도(손절·트레일링 등)도 공격적 지정가로 즉시체결 (체결지연 슬리피지 방지)
 # TIER_C는 시간청산 없음 — 트레일링 하나로만 청산
 
 # 티어별 종목당 상한 예산(안전판, 실제는 이 값과 tier예산비율×매수가능액 중 작은 쪽)
@@ -917,8 +918,8 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             res = place_aggressive(sym, sell_qty, cur, "sell", p.get("exchange"),
                                     TIER_C_MARKET_BUFFER_PCT)
         else:
-            res = kis.place_order(sym, sell_qty, cur, "sell", session="regular",
-                                   exchange=p.get("exchange"))
+            res = place_aggressive(sym, sell_qty, cur, "sell", p.get("exchange"),
+                                    EXIT_SELL_BUFFER_PCT)
         if res.get("rt_cd") != "0":
             log.warning("매도주문 실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
             continue
