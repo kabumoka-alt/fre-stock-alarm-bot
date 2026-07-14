@@ -49,9 +49,24 @@ ENTRY_MAX_CHANGE    = 12.0         # 진입 최대 등락률(%)
 MIN_PRICE           = 1.0          # $1 미만 제외(호가/LULD 정밀도 이슈 + 승률 애매)
 MAX_PRICE           = 20.0         # $20 초과 제외 (과거 $5~20 승률은 낮으니 로그 보고 조정)
 MIN_5MIN_DOLLAR_VOL = 100_000.0    # 최근 5분 거래대금 하한(USD) — 유동성/체결
-TAKE_PROFIT         = 5.0          # 익절(%)
-STOP_LOSS           = -3.0         # 손절(%)  ← 데이터가 지목한 유일한 교정 포인트
-TIME_EXIT_MIN       = 30           # 진입 후 N분 내 미도달 시 청산
+TAKE_PROFIT         = 5.0          # (미사용, 초입은 부분익절+트레일링으로 대체됨 — 하위호환 위해 남겨둠)
+STOP_LOSS           = -3.0         # (미사용, 아래 EARLY_STOP_LOSS_V2로 대체됨)
+TIME_EXIT_MIN       = 30           # (미사용, 초입은 시간청산 없이 부분익절+트레일링으로 청산)
+
+# ── v31(Railway 봇) 이식: 초입 — 부분익절 + 트레일링(고점추적) ──
+EARLY_PARTIAL_PCT    = 7.0         # 이 수익률에서 절반 익절
+EARLY_TRAIL_ACTIVATE = 6.0         # 고점이 이 이상 찍히면 트레일링 활성화
+EARLY_TRAIL_GAP      = 4.0         # 고점 대비 이만큼(%p) 빠지면 트레일링청산
+EARLY_STOP_LOSS_V2   = -8.0        # 손절(기존 STOP_LOSS -3.0 대체)
+
+# ── 티어A — 부분익절 + 트레일링(초입보다 넓게, 손절은 -3% 유지) ──
+TIER_A_PARTIAL_PCT    = 10.0
+TIER_A_TRAIL_ACTIVATE = 10.0
+TIER_A_TRAIL_GAP      = 6.0
+
+# ── 일일 리스크 게이트 (전체 계좌 공통, v31 이식) ──
+DAILY_PROFIT_LOCK_PCT = 5.0        # 당일 실현손익 +5% 도달 시 신규매수 중단
+DAILY_LOSS_LIMIT_PCT  = -4.0       # 당일 실현손익 -4% 도달 시 신규매수 중단
 
 SCREEN_INTERVAL     = 60           # 스크리닝 주기(초)
 MONITOR_INTERVAL    = 10           # 보유 종목 감시 주기(초)
@@ -115,6 +130,37 @@ def is_blacklisted(key: str) -> bool:
         del BLACKLIST[key]
         return False
     return True
+
+
+# ── 일일 리스크 게이트 상태 (v31 이식) — 개장 시 main()에서 리셋 ──
+daily_realized_pnl_usd = 0.0
+daily_start_capital = None   # None이면 계산 불가 상태 → 게이트 비활성(안전하게 매매 허용)
+
+
+def add_realized_pnl(qty_sold: int, entry_price: float, exit_price: float):
+    """매도(전체/부분) 성공 시 실현손익을 일일 누계에 더한다."""
+    global daily_realized_pnl_usd
+    daily_realized_pnl_usd += (exit_price - entry_price) * qty_sold
+
+
+def daily_pnl_pct() -> float:
+    if not daily_start_capital or daily_start_capital <= 0:
+        return 0.0
+    return daily_realized_pnl_usd / daily_start_capital * 100
+
+
+def buys_allowed():
+    """신규매수 허용 여부 + 사유. 보유분 청산(monitor_and_exit)은 이 게이트와 무관하게 항상 동작."""
+    if not daily_start_capital or daily_start_capital <= 0:
+        return True, ""   # 기준자본 계산 실패 시 게이트 비활성(매매는 계속 허용)
+    d = daily_pnl_pct()
+    if d >= DAILY_PROFIT_LOCK_PCT:
+        return False, f"수익잠금(당일 {d:+.1f}%)"
+    if d <= DAILY_LOSS_LIMIT_PCT:
+        return False, f"손실한도(당일 {d:+.1f}%)"
+    return True, ""
+
+
 NO_BARS    = set()   # 분봉 없는 종목(워런트/특수) — 세션 내 재조회 스킵
 
 logging.basicConfig(
@@ -662,6 +708,11 @@ def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pc
 
 
 def screen_and_enter(positions: dict):
+    ok, lock_reason = buys_allowed()
+    if not ok:
+        log.info("신규매수 중단 — %s (보유분 관리는 계속 진행)", lock_reason)
+        return
+
     cands = get_surge_candidates()
     if not cands:
         log.info("스캔 — 후보 0건")
@@ -785,8 +836,8 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             log.warning("감시 %s[%s]: 가격조회 실패(0) — 판단 불가", sym, tier)
             continue
 
-        # 티어C는 고점을 계속 추적 (트레일링 스톱의 기준)
-        if tier == "C":
+        # 초입/티어A/티어C는 고점을 계속 추적 (트레일링 스톱의 기준)
+        if tier in ("early", "A", "C"):
             p["peak_price"] = max(p.get("peak_price", p["entry_price"]), cur)
             save_positions(positions)
 
@@ -798,6 +849,8 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
                  " STALE" if stale else "")
 
         reason = None
+        exit_mode = "full"   # "full"=전량 청산, "half"=절반만 익절(포지션 유지)
+
         if force_all:
             reason = f"장마감 청산 ({pnl:+.1f}%)"
         elif tier == "C":
@@ -809,29 +862,40 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
                 if dd <= -TIER_C_TRAIL_PCT:
                     reason = f"트레일링청산 (고점대비{dd:.1f}%, 손익{pnl:+.1f}%)"
             # 티어C는 시간청산 없음
-        elif tier == "A":
-            # 티어A: 시간청산 없음 — 익절/손절로만 청산
-            if pnl >= TIER_A_TP:
-                reason = f"익절 +{pnl:.1f}%"
-            elif pnl <= TIER_A_SL:
+        elif tier in ("early", "A"):
+            # v31(Railway 봇) 이식: 손절 → 트레일링(고점추적) → 부분익절(절반) 순서로 체크
+            if tier == "early":
+                sl, trail_activate, trail_gap, partial_pct = (
+                    EARLY_STOP_LOSS_V2, EARLY_TRAIL_ACTIVATE, EARLY_TRAIL_GAP, EARLY_PARTIAL_PCT)
+            else:  # A
+                sl, trail_activate, trail_gap, partial_pct = (
+                    TIER_A_SL, TIER_A_TRAIL_ACTIVATE, TIER_A_TRAIL_GAP, TIER_A_PARTIAL_PCT)
+
+            peak_price = p.get("peak_price", p["entry_price"])
+            peak_pct = ((peak_price - p["entry_price"]) / p["entry_price"] * 100
+                        if p["entry_price"] > 0 else 0.0)
+
+            if pnl <= sl:
                 reason = f"손절 {pnl:.1f}%"
-        else:
-            if tier == "B":
-                tp, sl, tmax = TIER_B_TP, TIER_B_SL, TIER_B_TIME_EXIT_MIN
-            else:  # early
-                tp, sl, tmax = TAKE_PROFIT, STOP_LOSS, TIME_EXIT_MIN
-            if pnl >= tp:
+            elif peak_pct >= trail_activate and pnl <= (peak_pct - trail_gap):
+                reason = f"트레일링청산 (고점{peak_pct:+.1f}%, 손익{pnl:+.1f}%)"
+            elif pnl >= partial_pct and not p.get("partial_done"):
+                reason = f"{partial_pct:.0f}% 1차익절(절반)"
+                exit_mode = "half"
+        else:  # 티어B
+            if pnl >= TIER_B_TP:
                 reason = f"익절 +{pnl:.1f}%"
-            elif pnl <= sl:
+            elif pnl <= TIER_B_SL:
                 reason = f"손절 {pnl:.1f}%"
-            elif held >= tmax:
+            elif held >= TIER_B_TIME_EXIT_MIN:
                 reason = f"시간청산 {held:.0f}분 ({pnl:+.1f}%)"
 
         if not reason:
             continue
 
+        intended_qty = max(1, p["qty"] // 2) if exit_mode == "half" else p["qty"]
         sellable = get_overseas_sellable_qty(sym)
-        sell_qty = min(p["qty"], sellable) if sellable > 0 else p["qty"]
+        sell_qty = min(intended_qty, sellable) if sellable > 0 else intended_qty
         if sell_qty < 1:
             log.warning("매도수량 0 → 스킵: %s[%s]", sym, tier)
             continue
@@ -846,20 +910,29 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             log.warning("매도주문 실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
             continue
 
-        # ⚠️ 주문 접수(rt_cd=0)는 "체결 확정"이 아님 — 실제 잔고를 재조회해서
-        # 남은 수량이 진짜 0인지 확인한 뒤에만 장부에서 지운다.
-        # (부분체결 시 남은 수량을 장부에 남겨 계속 감시 → "유령 포지션" 방지)
-        remaining = get_overseas_sellable_qty(sym)
         emoji = "🔴" if pnl < 0 else "💰"
         tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
+        add_realized_pnl(sell_qty, p["entry_price"], cur)
 
+        if exit_mode == "half":
+            # 의도된 부분익절: 브로커 재조회 없이 로컬 장부만 갱신, 계속 보유·감시
+            p["qty"] = max(p["qty"] - sell_qty, 0)
+            p["partial_done"] = True
+            save_positions(positions)
+            notify(f"{emoji} 매도[{tag}] {sym} {sell_qty}주 {reason} @${cur:.2f} ({pnl:+.1f}%) "
+                   f"(잔여 {p['qty']}주 계속 보유·트레일링 관리)")
+            continue
+
+        # ⚠️ 전량청산 의도인 경우: 주문 접수(rt_cd=0)는 "체결 확정"이 아님 — 실제 잔고를
+        # 재조회해서 남은 수량이 진짜 0인지 확인한 뒤에만 장부에서 지운다.
+        # (부분체결 시 남은 수량을 장부에 남겨 계속 감시 → "유령 포지션" 방지)
+        remaining = get_overseas_sellable_qty(sym)
         if remaining <= 0:
             notify(f"{emoji} 매도[{tag}] {sym} {sell_qty}주 @${cur:.2f} — {reason}")
             BLACKLIST[key] = datetime.now()
             del positions[key]
             save_positions(positions)
         else:
-            # 부분체결: 판 만큼만 알리고, 남은 수량은 장부에 유지해서 다음 틱에 재시도
             sold = sell_qty - remaining
             notify(f"{emoji} 매도[{tag}] {sym} {max(sold,0)}주 부분체결 @${cur:.2f} — {reason} "
                    f"(잔여 {remaining}주 재시도 예정)")
@@ -890,11 +963,21 @@ def main():
         try:
             is_open, mins_to_close = get_clock()
 
-            # 개장 상태 변화 알림 (새 거래일 시작 시 마감알림 플래그/집계시작도 리셋)
+            # 개장 상태 변화 알림 (새 거래일 시작 시 마감알림 플래그/집계시작/일일게이트도 리셋)
             if is_open and not was_open:
                 notify("🔔 미국장 개장 — 스캔 시작")
                 force_close_announced = False
                 session_start = datetime.now()
+                global daily_realized_pnl_usd, daily_start_capital
+                daily_realized_pnl_usd = 0.0
+                try:
+                    cap = kis.get_buyable_amount("AAPL", 200.0)
+                except Exception as e:
+                    cap = 0.0
+                    log.warning("일일 기준자본 조회 실패(게이트 비활성): %s", e)
+                daily_start_capital = cap if cap and cap > 0 else None
+                if daily_start_capital:
+                    log.info("일일 리스크 게이트 기준자본: $%.2f", daily_start_capital)
             was_open = is_open
 
             if not is_open:
