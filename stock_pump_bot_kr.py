@@ -22,6 +22,13 @@
   활성화되어 고점 대비 -1.5%p 되밀리면 청산, +8%(net) 도달 시 트레일링 없이 즉시 확정.
   모든 손익 판단은 수수료·세금(왕복 약 0.24%)까지 반영한 순수익률 기준(net_gain_pct).
   분할매도 없음(전량 진입/전량 청산).
+- [v11] 일일 목표(+6%)는 '당일 신규 진입 종목'의 매매 손익만으로 판단 (이월 종목 제외),
+  수익률 분모는 당일 투입원금.
+- [v12] 매수/매도를 시장가(ORD_DVSN=01)로 전환 + 고아 포지션 자동 회수:
+  지정가 주문이 뒤늦게 체결되면 봇 장부엔 없고 계좌에만 있는 '고아 포지션'이 생겨
+  손절/익절이 불발되고 MAX_POSITIONS 제한도 무력화돼 보유종목이 무한 증식했다
+  (실제 26종목 사고). 시장가로 즉시 체결시키고, sync_orphan_positions()가 매 스캔
+  주기마다 실계좌와 장부를 대조해 누락 종목을 감시에 편입한다.
 - 보유종목 10초 주기 체크 (해외주식봇과 동일한 슬리피지 개선 적용)
 - 손절 2회 도달 시 당일 블랙리스트
 
@@ -349,16 +356,17 @@ def sim_open(code: str, name: str, price: float) -> bool:
         if result.get("rt_cd") != "0":
             print(f"  [매수 실패] {code} 주문 거부 → 장부 미기록 (rt_cd={result.get('rt_cd')})")
             return False
-        # 체결 반영까지 잠깐 대기 후 실보유수량 조회 (요청수량 대신 실체결 사용)
-        time.sleep(1.5)
-        now_holding = kis.get_kr_holding_qty(code)
-        filled_qty = now_holding - prev_holding
-        if filled_qty < 1:
-            # 접수는 됐으나 아직 체결 미확인 — 한 번 더 확인
-            time.sleep(1.5)
+        # [v12] 시장가 주문이라 즉시 체결이 원칙이나, 잔고 반영에 지연이 있을 수 있어
+        #       최대 5회(약 10초)까지 재확인한다. 여기서 못 잡아도 sync_orphan_positions()가
+        #       다음 주기에 고아 포지션으로 회수하므로 감시 누락은 발생하지 않는다.
+        filled_qty = 0
+        for _ in range(5):
+            time.sleep(2)
             filled_qty = kis.get_kr_holding_qty(code) - prev_holding
+            if filled_qty >= 1:
+                break
         if filled_qty < 1:
-            print(f"  [매수 미체결] {code} 주문했으나 체결수량 0 확인 → 장부 미기록")
+            print(f"  [매수 체결확인 실패] {code} 잔고 미반영 → 장부 미기록 (고아 포지션 감시로 회수 예정)")
             return False
         if filled_qty != req_qty:
             print(f"  [부분 체결] {code} 요청 {req_qty}주 → 실체결 {filled_qty}주 (장부에 실체결 반영)")
@@ -646,6 +654,43 @@ def build_report(title: str) -> str:
     return "\n".join(lines)
 
 
+def sync_orphan_positions():
+    """
+    [v12] 고아 포지션 회수 — 장중 주기적으로 실계좌와 봇 장부를 대조한다.
+
+    배경: 매수 주문이 즉시 체결 확인되지 않아 장부에 안 올라간 뒤, 뒤늦게 체결되면
+    계좌에는 있는데 봇은 모르는 '고아 포지션'이 된다. 그러면 (1) 손절/익절 감시가
+    안 되고 (2) sim_positions가 비어 MAX_POSITIONS 제한이 안 걸려 계속 새로 매수해
+    보유종목이 무한히 쌓인다 (실제로 26종목까지 쌓인 사고 발생).
+
+    이 함수가 매 스캔 주기마다 계좌를 확인해 장부에 없는 보유종목을 감시 목록에
+    편입시킴으로써, 체결 확인이 실패해도 최대 1주기 안에 자동 회수된다.
+    """
+    try:
+        bal = kis.get_domestic_balance()
+    except Exception as e:
+        print(f"[고아 포지션 점검 실패] {e}")
+        return
+    adopted = 0
+    for h in bal.get("output1", []):
+        code = h.get("pdno")
+        qty = int(float(h.get("hldg_qty", 0) or 0))
+        avg = float(h.get("pchs_avg_pric", 0) or 0)
+        name = h.get("prdt_name", "")
+        if not code or qty <= 0 or avg <= 0:
+            continue
+        if code in sim_positions:
+            continue  # 이미 감시 중
+        # 장부에 없는데 계좌에 있음 = 고아 → 감시 편입 (매입평균가를 진입가로)
+        entry_prices[code] = {"entry": avg, "time": get_kst_now(), "alert1": None, "alert2": None, "stop": None}
+        sim_positions[code] = {"entry": avg, "qty": qty, "name": name}
+        opened_today.add(code)  # 봇이 오늘 산 것으로 보고 당일 손익에 포함
+        adopted += 1
+        print(f"  [고아 포지션 회수] {code}({name}) {qty}주 @ {avg:,.0f}원 → 감시 편입")
+    if adopted:
+        send_telegram(f"🔧 [국장] 장부 누락 {adopted}종목 감시 편입 (매수 체결확인 실패분 회수)")
+
+
 def restore_positions_from_account():
     """봇 시작 시 실계좌 잔고를 읽어 감시 대상(entry_prices/sim_positions) 복원.
     [v3] sim_stats["cash"]는 여기서 조정하지 않는다 — 이제 LIVE_TRADING 예산 계산은
@@ -767,6 +812,9 @@ def main():
             now_mono = time.monotonic()
             if now_mono - last_scan_time >= CHECK_INTERVAL:
                 last_scan_time = now_mono
+                # [v12] 스캔 전 항상 실계좌와 장부 대조 → 고아 포지션 회수.
+                #       매수 여부와 무관하게 실행해야 감시 누락이 안 쌓인다.
+                sync_orphan_positions()
                 if buy_window_open:
                     print(f"\n[{now_str}] 정규장 스캔 시작")
                     run_scan()
