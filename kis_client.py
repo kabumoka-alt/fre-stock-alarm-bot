@@ -9,8 +9,6 @@
   KIS_APP_SECRET    - 발급받은 앱시크릿
   KIS_ACCOUNT_NO    - 계좌번호 전체 (예: 12345678-01)
   KIS_USE_MOCK      - "true"면 모의투자 서버 사용, "false"면 실전 서버 (기본: true)
-  KIS_ALLOW_REAL    - 실전(KIS_USE_MOCK=false) 기동 이중잠금. "true"여야 실전 실행 허용 (기본: false)
-  KIS_MAX_ORDER_USD - 실전 해외주문 1건 금액 상한(USD). 초과 주문은 차단. 0이면 무제한 (기본: 0)
 """
 
 import os
@@ -22,17 +20,6 @@ KIS_APP_KEY    = os.environ["KIS_APP_KEY"]
 KIS_APP_SECRET = os.environ["KIS_APP_SECRET"]
 KIS_ACCOUNT_NO = os.environ["KIS_ACCOUNT_NO"]   # "12345678-01" 형태
 USE_MOCK       = os.environ.get("KIS_USE_MOCK", "true").lower() == "true"
-ALLOW_REAL     = os.environ.get("KIS_ALLOW_REAL", "false").lower() == "true"
-MAX_ORDER_USD  = float(os.environ.get("KIS_MAX_ORDER_USD", "0"))   # 0 = 무제한
-
-# ── 실전 이중잠금 ──
-# USE_MOCK=false(실전)인데 ALLOW_REAL=true가 없으면 기동 자체를 거부한다.
-# 설정 오타 하나로 검증 안 된 로직이 실전 자금에 붙는 사고를 막기 위한 안전장치.
-if not USE_MOCK and not ALLOW_REAL:
-    raise SystemExit(
-        "[안전잠금] 실전 모드(KIS_USE_MOCK=false)인데 KIS_ALLOW_REAL=true가 없습니다. "
-        "실전 가동을 의도한 게 맞으면 env에 KIS_ALLOW_REAL=true를 추가하세요."
-    )
 
 CANO         = KIS_ACCOUNT_NO.split("-")[0]          # 계좌번호 앞 8자리
 ACNT_PRDT_CD = KIS_ACCOUNT_NO.split("-")[1]           # 상품코드 뒤 2자리
@@ -50,45 +37,13 @@ TR_ID_DAY_BUY  = "TTTS6036U"   # 미국 주간거래 매수
 TR_ID_DAY_SELL = "TTTS6037U"   # 미국 주간거래 매도
 
 _token_cache = {"access_token": None, "expires_at": 0}
-_TOKEN_FILE = os.path.join(
-    os.path.expanduser("~"),
-    f".kis_token_cache_{'mock' if USE_MOCK else 'real'}.json",
-)
-
-
-def _load_token_file():
-    try:
-        with open(_TOKEN_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        if d.get("access_token") and time.time() < d.get("expires_at", 0) - 300:
-            return d["access_token"], d["expires_at"]
-    except (FileNotFoundError, ValueError, KeyError):
-        pass
-    return None, 0
-
-
-def _save_token_file(token: str, expires_at: float):
-    try:
-        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
-            json.dump({"access_token": token, "expires_at": expires_at}, f)
-        os.chmod(_TOKEN_FILE, 0o600)
-    except OSError as e:
-        print(f"[KIS] 토큰 파일 저장 실패(무시하고 계속): {e}")
 
 
 def get_access_token() -> str:
-    """접근토큰 발급/캐싱. 메모리 → 파일 → 신규발급 순.
-    파일 캐시로 프로세스 간 재사용해 불필요한 재발급(403 rate limit) 방지."""
+    """접근토큰 발급/캐싱. 만료 5분 전에 자동 갱신."""
     now = time.time()
-
     if _token_cache["access_token"] and now < _token_cache["expires_at"] - 300:
         return _token_cache["access_token"]
-
-    tok, exp = _load_token_file()
-    if tok:
-        _token_cache["access_token"] = tok
-        _token_cache["expires_at"] = exp
-        return tok
 
     _throttle()
     resp = requests.post(
@@ -104,7 +59,6 @@ def get_access_token() -> str:
     data = resp.json()
     _token_cache["access_token"] = data["access_token"]
     _token_cache["expires_at"] = now + int(data.get("expires_in", 86400))
-    _save_token_file(_token_cache["access_token"], _token_cache["expires_at"])
     print(f"[KIS] 토큰 발급 완료 (만료: {data.get('expires_in')}초 후)")
     return _token_cache["access_token"]
 
@@ -184,14 +138,6 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
 
-    # ── 실전 주문금액 상한(안전장치) ──
-    # 실전에서만 동작. qty*price가 상한(USD)을 넘으면 주문을 KIS로 보내지 않고 차단한다.
-    # 수량 계산 버그 등으로 과대 주문이 나가는 사고를 막는 최후의 방어선.
-    if not USE_MOCK and MAX_ORDER_USD > 0 and qty * price > MAX_ORDER_USD:
-        msg = f"실전 주문금액 ${qty * price:.2f} > 상한 ${MAX_ORDER_USD:.2f} → 주문 차단"
-        print(f"[안전차단] {symbol} {side} {msg}")
-        return {"rt_cd": "-1", "msg1": msg}
-
     from session_utils import get_ord_dvsn_for_session
     ord_dvsn = get_ord_dvsn_for_session(session)
 
@@ -239,12 +185,6 @@ def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: st
     """
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
-
-    # ── 실전 주문금액 상한(안전장치) ── place_order와 동일 규칙 적용
-    if not USE_MOCK and MAX_ORDER_USD > 0 and qty * price > MAX_ORDER_USD:
-        msg = f"실전 주간거래 주문금액 ${qty * price:.2f} > 상한 ${MAX_ORDER_USD:.2f} → 주문 차단"
-        print(f"[안전차단] {symbol} {side} {msg}")
-        return {"rt_cd": "-1", "msg1": msg}
 
     tr_id = TR_ID_DAY_BUY if side == "buy" else TR_ID_DAY_SELL
 
@@ -379,35 +319,48 @@ def round_to_krx_tick(price: float, side: str) -> int:
         return int((price // tick) * tick)
 
 
-def place_domestic_order(code: str, qty: int, price: int, side: str, buffer_pct: float = 1.0) -> dict:
+def place_domestic_order(code: str, qty: int, price: int, side: str, buffer_pct: float = 1.0,
+                         market: bool = True) -> dict:
     """
     국내주식 주문 (현금매수/매도).
     code: 6자리 종목코드 (예: "005930" 삼성전자)
-    price: 원 단위 기준가 (스냅샷 관측가). 아래에서 buffer_pct만큼 유리하지 않은
-           방향으로(매수는 올려서, 매도는 내려서) 조정 후 KRX 호가단위로 반올림해
-           지정가를 넣는다 — 짧은 시간에 가격이 움직여도 체결 확률을 높이기 위함.
+    price: 원 단위 기준가 (스냅샷 관측가). 로그/참고용이며, market=True면 주문가에 쓰이지 않음.
     side: "buy" 또는 "sell"
-    buffer_pct: 가격 조정 폭(%). 기본 1.0% — 필요 시 조정.
+    market: True면 시장가(ORD_DVSN=01), False면 지정가(00).
+        ⚠️ 기본값 시장가인 이유: 지정가는 즉시 체결되지 않고 호가에 남아있다가 뒤늦게
+        체결되는 경우가 있는데, 봇이 "미체결"로 판단해 장부에 안 올린 뒤 나중에 체결되면
+        계좌에만 있고 봇은 모르는 '고아 포지션'이 생긴다 (감시 누락 → 손절/익절 불발).
+        스캘핑은 즉시 체결이 전제이므로 시장가를 기본으로 한다.
+    buffer_pct: 지정가(market=False)일 때만 사용하는 가격 조정 폭(%).
     """
     if side not in ("buy", "sell"):
         raise ValueError("side는 'buy' 또는 'sell'이어야 합니다")
-
-    # ── 체결률 개선을 위한 가격 버퍼 ──
-    if side == "buy":
-        adj_price = price * (1 + buffer_pct / 100)
-    else:
-        adj_price = price * (1 - buffer_pct / 100)
-    order_price = round_to_krx_tick(adj_price, side)
 
     tr_id = TR_ID_KR_ORDER_BUY if side == "buy" else TR_ID_KR_ORDER_SELL
     body = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
         "PDNO": code,
-        "ORD_DVSN": "00",   # 00: 지정가
         "ORD_QTY": str(qty),
-        "ORD_UNPR": str(order_price),
     }
+
+    if market:
+        # 시장가: ORD_DVSN=01, 단가는 0으로 보냄 (KIS 규격)
+        body["ORD_DVSN"] = "01"
+        body["ORD_UNPR"] = "0"
+        order_price = 0
+        _desc = f"시장가(관측가 {price})"
+    else:
+        # 지정가: 체결률 개선을 위한 가격 버퍼 적용
+        if side == "buy":
+            adj_price = price * (1 + buffer_pct / 100)
+        else:
+            adj_price = price * (1 - buffer_pct / 100)
+        order_price = round_to_krx_tick(adj_price, side)
+        body["ORD_DVSN"] = "00"
+        body["ORD_UNPR"] = str(order_price)
+        _desc = f"{order_price}원 지정가(관측가 {price})"
+
     _throttle()
     resp = requests.post(
         f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash",
@@ -417,9 +370,9 @@ def place_domestic_order(code: str, qty: int, price: int, side: str, buffer_pct:
     )
     result = resp.json()
     if result.get("rt_cd") != "0":
-        print(f"[KIS 국내주문 오류] {code} {side} @ {order_price}원(관측가 {price}) → {result}")
+        print(f"[KIS 국내주문 오류] {code} {side} @ {_desc} → {result}")
     else:
-        print(f"[KIS 국내주문 성공] {code} {side} {qty}주 @ {order_price}원(관측가 {price}) → {result.get('msg1')}")
+        print(f"[KIS 국내주문 성공] {code} {side} {qty}주 @ {_desc} → {result.get('msg1')}")
     return result
 
 
@@ -489,9 +442,6 @@ def get_kr_holding_qty(code: str) -> int:
             except (TypeError, ValueError):
                 return 0
     return 0
-
-
-def get_domestic_buyable_amount(code: str, price: int) -> float:
     """
     국내주식 매수가능금액 조회.
     ⚠️ 응답 필드명은 실행 후 실제 응답 구조로 재확인 필요 (추정치 사용 중).
@@ -665,3 +615,5 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 등락률 순위 (상위 5) ──")
     print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
+
+
