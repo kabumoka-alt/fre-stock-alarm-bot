@@ -29,6 +29,11 @@
   손절/익절이 불발되고 MAX_POSITIONS 제한도 무력화돼 보유종목이 무한 증식했다
   (실제 26종목 사고). 시장가로 즉시 체결시키고, sync_orphan_positions()가 매 스캔
   주기마다 실계좌와 장부를 대조해 누락 종목을 감시에 편입한다.
+- [v13] 진입 타이밍 개선 — '급등 초입'만 노리도록 스코어링 반전:
+  기존은 1분 변화율↑·RSI↑일수록 고득점이라 "가장 많이 오르고 가장 과열된" 종목에
+  최고점을 줘 고점 매수→되돌림 손절이 반복됐다. 이제 1분 변화율은 3~5%가 최적(그 이상
+  감점), RSI는 50~65(상승 초입)가 최적이고 75+는 감점, 당일 상승률이 낮을수록 가점,
+  거래량 서지 비중 상향(0.3→0.35). 당일 +18% 이상 오른 종목은 아예 진입 제외.
 - 보유종목 10초 주기 체크 (해외주식봇과 동일한 슬리피지 개선 적용)
 - 손절 2회 도달 시 당일 블랙리스트
 
@@ -70,6 +75,12 @@ MAX_POSITIONS         = 3        # v38 집중투자 기준
 # [v2] 스코어링 도입
 MIN_ENTRY_SCORE   = 6.0     # 가중점수 10점 만점 중 최소 통과선 (아래 calc_entry_score 참고)
 LIMIT_UP_THRESHOLD = 29.0   # 전일대비 등락률(%) 이 값 이상이면 상한가 근접으로 보고 제외
+
+# [v14] 당일 상승률 상한. v13에서 18%로 조였더니 후보가 과하게 줄어 25%로 완화.
+#   과열 종목 차단은 하드 필터보다 스코어링(RSI 감점 + 당일상승률 감점)에 맡긴다 —
+#   실제로 당일 +22%/RSI85 종목은 점수 5.4로 통과선(6.0)에 자연히 못 미친다.
+#   여기 상한은 상한가 근접 같은 극단만 걸러내는 안전핀 역할.
+MAX_TODAY_GAIN_PCT = 25.0   # 전일대비 이 % 이상 오른 종목은 진입 제외
 
 # [v7] 익절폭 > 손절폭 구조로 전환 + 트레일링 스탑
 #      (등락률 상위를 쫓는 모멘텀 전략은 승률이 낮게 나오기 쉬워서, 손익비를 반대로
@@ -255,27 +266,56 @@ def calc_volume_surge(bars):
     return ratio, ratio >= 1.5
 
 
-def calc_entry_score(price_change_1m: float, vol_ratio: float, rsi) -> float:
+def calc_entry_score(price_change_1m: float, vol_ratio: float, rsi, change_pct_today: float = 0.0) -> float:
     """
-    [v2] 해외주식봇 v35 스타일 가중점수 (10점 만점).
-    - 1분 변화율 (0.5 가중): 10%p까지 선형, 그 이상은 캡
-    - 거래량서지 (0.3 가중): 5배까지 선형, 그 이상은 캡
-    - RSI (0.2 가중): 과매수(70+)일수록 가산 — 필터가 아니라 모멘텀 강도로 취급
-    RSI/거래량은 진입을 막는 조건이 아니라 우선순위를 정하는 데만 쓰임.
+    [v13] 급등 '초입' 우선 스코어링 (10점 만점).
+
+    기존(v2)은 1분 변화율이 클수록·RSI가 높을수록 점수를 줬는데, 이는 곧
+    "가장 많이 오르고 가장 과열된 종목"에 최고점을 주는 구조였다. 등락률 순위로
+    이미 오른 종목을 스크리닝하는 상황에서 이러면 고점 매수 → 되돌림 손절이 반복된다
+    (실제로 점수 10.0 종목이 -5% 손절나는 사례 다수).
+
+    그래서 배점을 뒤집는다:
+    - 1분 변화율 (0.35): 3~5%p 구간이 최적. 그 이상 급등은 오히려 감점(추격매수 방지)
+    - 거래량서지 (0.35): 진짜 수급이 붙었는지 — 초입 판별에 가장 신뢰도 높음. 비중 상향
+    - RSI (0.15): 과열이면 감점. 50~65가 최적(상승 초입), 75+는 이미 과열
+    - 당일 상승률 (0.15): 낮을수록 가점 — 이제 막 오르기 시작한 종목 우대
     """
-    change_score = min(max(price_change_1m, 0.0), 10.0)
+    # 1분 변화율: 3~5%가 만점, 그 이상은 과열로 감점
+    if price_change_1m <= 5.0:
+        change_score = min(price_change_1m / 5.0 * 10.0, 10.0)
+    else:
+        change_score = max(10.0 - (price_change_1m - 5.0) * 1.5, 0.0)
+
+    # 거래량 서지: 수급 유입 강도 (5배까지 선형)
     volume_score = min(max(vol_ratio, 0.0), 5.0) * 2.0
+
+    # RSI: 상승 초입(50~65)이 최적, 과열(75+)은 감점
     if rsi is None:
         rsi_score = 5.0
+    elif rsi >= 80:
+        rsi_score = 0.0      # 극과열 — 되돌림 임박
     elif rsi >= 70:
-        rsi_score = 10.0
+        rsi_score = 3.0      # 과열
     elif rsi >= 50:
-        rsi_score = 7.0
+        rsi_score = 10.0     # 상승 초입 (최적)
     elif rsi >= 40:
-        rsi_score = 4.0
+        rsi_score = 6.0
     else:
-        rsi_score = 0.0
-    return change_score * 0.5 + volume_score * 0.3 + rsi_score * 0.2
+        rsi_score = 2.0      # 하락 추세
+
+    # 당일 상승률: 낮을수록 초입 (0~8%가 최적, 20%+는 막차)
+    if change_pct_today <= 8.0:
+        today_score = 10.0
+    elif change_pct_today <= 15.0:
+        today_score = 6.0
+    elif change_pct_today <= 20.0:
+        today_score = 3.0
+    else:
+        today_score = 0.0
+
+    return (change_score * 0.35 + volume_score * 0.35
+            + rsi_score * 0.15 + today_score * 0.15)
 
 
 def is_preferred_stock(name: str) -> bool:
@@ -543,6 +583,8 @@ def run_scan():
             continue  # [v9] ETN/ETF/레버리지 등 파생상품 제외 (모멘텀 왜곡·유동성 문제)
         if stock.get("change_pct", 0) >= LIMIT_UP_THRESHOLD:
             continue  # [v2] 상한가 근접 제외 (더 못 먹고 급락 리스크만 남은 구간)
+        if stock.get("change_pct", 0) >= MAX_TODAY_GAIN_PCT:
+            continue  # [v13] 이미 많이 오른 종목 제외 — 급등 초입만 노림
         if code in last_alert:
             elapsed = (get_kst_now() - last_alert[code]).total_seconds() / 60
             if elapsed < COOLDOWN_MINUTES:
@@ -560,8 +602,10 @@ def run_scan():
 
         rsi = calc_rsi(bars)
         vol_ratio, _ = calc_volume_surge(bars)
-        score = calc_entry_score(price_change_1m, vol_ratio, rsi)
-        print(f"[🚀 후보] {code}({stock['name']}) 1분{price_change_1m:+.2f}% RSI{rsi} 거래량{vol_ratio:.1f}x 점수{score:.1f} 가격{stock['price']:.0f}원")
+        today_gain = stock.get("change_pct", 0)
+        score = calc_entry_score(price_change_1m, vol_ratio, rsi, today_gain)
+        _rsi_str = f"{rsi:.0f}" if rsi is not None else "N/A"
+        print(f"[🚀 후보] {code}({stock['name']}) 1분{price_change_1m:+.2f}% 당일{today_gain:+.1f}% RSI{_rsi_str} 거래량{vol_ratio:.1f}x 점수{score:.1f} 가격{stock['price']:.0f}원")
 
         if score < MIN_ENTRY_SCORE:
             continue  # [v2] 점수 미달은 후보에서 제외
@@ -747,7 +791,7 @@ def main():
     print("🚀 국내주식(KRX) 급등 감지 봇 시작! (v4)")
     print(f"🔌 LIVE_TRADING: {'ON (KIS 국내 모의투자 연동)' if LIVE_TRADING else 'OFF (시뮬만)'}")
     print(f"📈 1분 {PRICE_CHANGE_1M}%+ (1차필터) → 가중점수 {MIN_ENTRY_SCORE}점+ 만 매수 | {MIN_PRICE:,}원+ | 상위 {TOP_N}종목")
-    print(f"🛡️ 상한가({LIMIT_UP_THRESHOLD}%+) 근접·우선주 제외")
+    print(f"🛡️ 상한가({LIMIT_UP_THRESHOLD}%+) 근접·우선주·ETN 제외 | 당일 {MAX_TODAY_GAIN_PCT}%+ 상승 종목 제외(급등 초입만)")
     print(f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산 (누적, 몰빵 아님)")
     print(f"🎯 매도: 손절 {STOP_LOSS_PCT}%(net) | 트레일링 활성 +{TRAIL_ACTIVATE_PCT}%→고점대비 -{TRAIL_GAP_PCT}%p 청산 | 상한 +{SELL_FULL_PCT}%(net)")
     print(f"📅 일일 누적목표: +{DAILY_PROFIT_TARGET_PCT}% 도달 시 그날 신규 매수 중단 (보유종목 감시는 계속)")
@@ -759,7 +803,7 @@ def main():
         f"🤖 <b>국내주식(KRX) 급등 감지 봇 시작! (v4)</b>\n"
         f"🔌 LIVE_TRADING: <b>{'ON' if LIVE_TRADING else 'OFF (시뮬만)'}</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ 1차필터 → 가중점수 {MIN_ENTRY_SCORE}점+ 매수 | {MIN_PRICE:,}원+ 종목만\n"
-        f"🛡️ 상한가 근접·우선주 제외\n"
+        f"🛡️ 상한가 근접·우선주·ETN 제외 | 당일 {MAX_TODAY_GAIN_PCT}%+ 제외(초입만)\n"
         f"💰 예산: 매수가능금액 전액을 {MAX_POSITIONS}슬롯 분산 (누적, 몰빵 아님)\n"
         f"🎯 손절 {STOP_LOSS_PCT}%(net) | 트레일링 +{TRAIL_ACTIVATE_PCT}%→-{TRAIL_GAP_PCT}%p | 상한 +{SELL_FULL_PCT}%(net)\n"
         f"📅 일일 누적목표 +{DAILY_PROFIT_TARGET_PCT}% 도달 시 신규매수 중단\n"
