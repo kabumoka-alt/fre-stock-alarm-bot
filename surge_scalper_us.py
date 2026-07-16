@@ -48,7 +48,8 @@ ENTRY_MIN_CHANGE    = 5.0          # 진입 최소 등락률(%, 전일종가 대
 ENTRY_MAX_CHANGE    = 12.0         # 진입 최대 등락률(%)
 MIN_PRICE           = 1.0          # $1 미만 제외(호가/LULD 정밀도 이슈 + 승률 애매)
 MAX_PRICE           = 20.0         # $20 초과 제외 (과거 $5~20 승률은 낮으니 로그 보고 조정)
-MIN_5MIN_DOLLAR_VOL = 5_000.0      # 최근 5분 거래대금 하한(USD) — IEX 저평가 감안
+MIN_5MIN_DOLLAR_VOL = 5_000.0      # 최근 5분 거래대금 하한(USD) — IEX 저평가 감안(2026-07-10 JLHL 사례로 확정)
+MOMENTUM_1M_MIN_PCT = 3.0          # 티어A/B/C 공통: 최근 1분봉 상승폭 최소기준(v31 이식, 2026-07-15 저승률 데이터로 도입)
 TAKE_PROFIT         = 5.0          # (미사용, 초입은 부분익절+트레일링으로 대체됨 — 하위호환 위해 남겨둠)
 STOP_LOSS           = -3.0         # (미사용, 아래 EARLY_STOP_LOSS_V2로 대체됨)
 TIME_EXIT_MIN       = 30           # (미사용, 초입은 시간청산 없이 부분익절+트레일링으로 청산)
@@ -545,11 +546,12 @@ def in_price_band(m: dict) -> bool:
 
 
 def is_warrant(sym: str) -> bool:
-    """워런트/유닛 등 파생 티커 판별 (v31 이식)."""
-    s2 = sym.upper()
-    if any(suffix in s2 for suffix in (".WS", ".WT", ".U", ".UN", ".RT", ".R")):
+    """워런트/유닛 등 파생 티커 판별 (v31 이식). 분봉 데이터가 아예 없거나
+    거래소 매핑이 안 되는 경우가 많아 애초에 후보에서 제외."""
+    s = sym.upper()
+    if any(suffix in s for suffix in (".WS", ".WT", ".U", ".UN", ".RT", ".R")):
         return True
-    if len(s2) >= 5 and s2.endswith("W") and "." not in s2:
+    if len(s) >= 5 and s.endswith("W") and "." not in s:
         return True
     return False
 
@@ -615,8 +617,16 @@ def _basic_bars(symbol: str, limit: int = 6):
     return bars
 
 
+def _momentum_1m_ok(closes: list) -> bool:
+    """v31 이식: 최근 1분봉(마지막 종가 vs 직전 종가) 상승폭이 최소기준 이상인지."""
+    if len(closes) < 2 or closes[-2] <= 0:
+        return False
+    change_1m = (closes[-1] - closes[-2]) / closes[-2] * 100
+    return change_1m >= MOMENTUM_1M_MIN_PCT
+
+
 def passes_tier_a(symbol: str) -> bool:
-    """티어A: 하락 중(연속 페이드아웃)만 아니면 통과 — 거래량/유동성 조건 없음."""
+    """티어A(+티어C 최소필터로 재사용): 하락 중만 아니면 통과 + 최근 1분봉 모멘텀 확인."""
     bars = _basic_bars(symbol, limit=6)
     if not bars:
         return False
@@ -624,7 +634,9 @@ def passes_tier_a(symbol: str) -> bool:
     closes = [b["c"] for b in last5]
     rising = closes[-1] > closes[0]
     not_fading = not (closes[-3] > closes[-2] > closes[-1])
-    return rising and not_fading
+    if not (rising and not_fading):
+        return False
+    return _momentum_1m_ok(closes)
 
 
 def passes_tier_b(symbol: str) -> bool:
@@ -643,7 +655,7 @@ def passes_tier_b(symbol: str) -> bool:
     dollar_vol = sum(b["v"] * b["c"] for b in last5)
     if dollar_vol < MIN_5MIN_DOLLAR_VOL:
         return False
-    return True
+    return _momentum_1m_ok(closes)
 
 
 def get_rank1_candidate():
