@@ -923,7 +923,10 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         sellable = get_overseas_sellable_qty(sym)
         sell_qty = min(intended_qty, sellable) if sellable > 0 else intended_qty
         if sell_qty < 1:
-            log.warning("매도수량 0 → 스킵: %s[%s]", sym, tier)
+            log.warning("매도수량 0 (실물 없음) → 유령 장부 제거: %s[%s]", sym, tier)
+            notify(f"🧹 유령 포지션 정리[{tier}] {sym} — 계좌에 실물 없음, 장부에서 제거")
+            del positions[key]
+            save_positions(positions)
             continue
 
         if tier == "C":
@@ -933,7 +936,13 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             res = place_aggressive(sym, sell_qty, cur, "sell", p.get("exchange"),
                                     EXIT_SELL_BUFFER_PCT)
         if res.get("rt_cd") != "0":
-            log.warning("매도주문 실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
+            msg1 = res.get("msg1", "")
+            log.warning("매도주문 실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), msg1)
+            if get_overseas_sellable_qty(sym) <= 0:
+                log.warning("매도실패 + 실물 0 확인 → 유령 장부 제거: %s[%s]", sym, tier)
+                notify(f"🧹 유령 포지션 정리[{tier}] {sym} — 계좌에 실물 없음, 장부에서 제거")
+                del positions[key]
+                save_positions(positions)
             continue
 
         emoji = "🔴" if pnl < 0 else "💰"
