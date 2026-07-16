@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v31 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v32 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -18,10 +18,32 @@
 - [v31] 횡보청산 완화: 트레일링 활성(고점≥활성임계) 종목은 횡보청산 면제
 - [v31] 일일 리스크 게이트: 당일 실현손익 +5% 도달 시 신규매수 중단(수익잠금),
         -4% 도달 시 신규매수 중단(손실한도). 보유분 청산 로직은 계속 동작.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[v32] 손절 슬리피지 근본 원인 제거 — 4개 수정
+  1) 보유 종목 감시를 별도 스레드로 분리 (3초 주기).
+     기존: 손절 체크가 run_scan() 맨 앞 1회 → 스캔(최대 63 API콜, 15~30초)
+           + sleep 30초 = 실효 감시 간격 45~90초.
+           그래서 -8% 손절이 -18%, -21%에 체결됨.
+     변경: 감시 스레드는 보유 종목만 API 1콜로 3초마다 체크. 스캔과 무관.
+  2) sim_close 시 entry_prices 정리 (기존엔 영구 잔류 → 스캔 누적 지연 유발)
+  3) 유령 진입 제거: 매수 성공한 종목만 entry_prices 등록
+     (기존엔 매수 실패/스킵해도 등록되어 감시 대상에 포함)
+  4) 중복 get_bars 제거: ATR 재정렬에서 받은 bars를 analyze_regular에 재사용
+     (스캔당 최대 30콜 절감 → 스캔 소요시간 약 절반)
+
+  ※ 이번 버전에서 의도적으로 "안 바꾼" 것들 (효과 측정을 위해 분리):
+     - 1주 절반익절 버그 (max(1, qty//2) → 1주면 전량청산)
+     - 스프레드/유동성 필터
+     - ATR 기반 사이징
+     - 서머타임 처리 (get_et_now UTC-4 하드코딩, 11월에 깨짐)
+     → 위 4개 효과를 하루 확인한 뒤 v33에서 적용할 것.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
 import time
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -37,7 +59,10 @@ PRICE_CHANGE_1M      = 3.0
 VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 기준
 MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
 
-CHECK_INTERVAL        = 30   # [v31] 60 → 30초 (폴링 갭 축소로 손절 슬리피지 완화)
+# [v32] 스캔 주기와 보유 종목 감시 주기를 분리
+SCAN_INTERVAL           = 30  # 신규 종목 스캔 주기(초) — 기존 CHECK_INTERVAL
+POSITION_CHECK_INTERVAL = 3   # 보유 종목 감시 주기(초) — 손절/트레일링 반응 속도
+
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
 MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
@@ -67,6 +92,10 @@ HEADERS = {
 
 entry_prices = {}
 last_alert   = {}
+
+# [v32] 감시 스레드와 메인 스캔 스레드가 공유 상태를 동시에 건드리지 않도록 보호.
+# RLock인 이유: sim_close 내부에서 다시 락을 잡는 경로가 생겨도 데드락이 나지 않게.
+state_lock = threading.RLock()
 
 # ──────────────────────────────────────────
 # 시뮬레이션 상태
@@ -104,6 +133,9 @@ trade_log: list = []
 # 매시 정각 / 장마감 전송 추적
 last_hourly_report_et: int = -1
 market_close_sent: bool    = False
+
+# [v32] 슬리피지 진단용 — 손절 트리거 시 실제 체결 괴리 기록
+slippage_log: list = []
 
 
 # ──────────────────────────────────────────
@@ -234,6 +266,26 @@ def blacklist_block() -> str:
 
 
 # ──────────────────────────────────────────
+# [v32] 슬리피지 진단 블록
+# ──────────────────────────────────────────
+
+def slippage_block() -> str:
+    """
+    손절 실제 체결이 STOP_LOSS_PCT에서 얼마나 벗어났는지 요약.
+    감시 스레드 분리 효과를 하루 단위로 검증하기 위한 지표.
+    """
+    if not slippage_log:
+        return ""
+    excesses = [s["excess"] for s in slippage_log]
+    worst    = max(slippage_log, key=lambda s: s["excess"])
+    avg      = sum(excesses) / len(excesses)
+    return (
+        f"🩺 <b>손절 슬리피지:</b> {len(slippage_log)}건 | "
+        f"평균 초과 {avg:.2f}%p | 최악 {worst['sym']} {worst['excess']:.2f}%p"
+    )
+
+
+# ──────────────────────────────────────────
 # 매매일지 빌더
 # ──────────────────────────────────────────
 
@@ -282,6 +334,11 @@ def build_trade_report(title: str) -> str:
     bl = blacklist_block()
     if bl:
         lines.append(bl)
+
+    # [v32] 슬리피지 진단
+    sl = slippage_block()
+    if sl:
+        lines.append(sl)
 
     # [v31] 일일 게이트 상태 표시
     ok, reason = buys_allowed()
@@ -358,6 +415,10 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 
     if pos["qty"] <= 0:
         del sim_positions[sym]
+        # [v32] 포지션이 완전히 닫혔으면 entry_prices도 같이 제거.
+        # 기존엔 남아 있어서 (a) 청산된 종목이 매 스캔마다 API 조회 대상이 되고
+        # (b) check_sell_timing이 옛 진입가로 계속 돌아 스캔이 날이 갈수록 느려짐 → 슬리피지 악화.
+        entry_prices.pop(sym, None)
         sim_stats["total_pnl"] += pnl
         sim_stats["trades"]    += 1
         if pnl >= 0:
@@ -378,6 +439,14 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         else:
             remaining = MAX_STOP_LOSS_COUNT - cnt
             print(f"  [손절 카운트] {sym} — {cnt}회째 (재진입 {remaining}회 더 허용)")
+
+        # [v32] 슬리피지 기록: 의도한 -8%와 실제 체결률의 괴리
+        excess = abs(pnl_pct) - abs(STOP_LOSS_PCT)
+        if excess > 0:
+            slippage_log.append({"sym": sym, "actual": pnl_pct, "excess": excess})
+            mark = "🚨" if excess >= 3.0 else "⚠️"
+            print(f"  {mark} [슬리피지] {sym} 의도 {STOP_LOSS_PCT:.1f}% → 실제 {pnl_pct:+.2f}% "
+                  f"(초과 {excess:.2f}%p)")
 
     now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
     trade_log.append({
@@ -672,11 +741,59 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
 
 
 # ──────────────────────────────────────────
+# [v32] 보유 종목 감시 스레드
+# ──────────────────────────────────────────
+
+def position_monitor_loop():
+    """
+    [v32] 보유 종목만 POSITION_CHECK_INTERVAL(3초)마다 감시하는 독립 스레드.
+
+    왜 필요한가:
+      기존 v31은 손절 체크가 run_scan() 맨 앞에서 1회만 돌았고, 그 뒤로
+      스크리너 1콜 + 스냅샷 2콜 + get_bars 최대 60콜(ATR용 30 + analyze용 30 중복)
+      + time.sleep(0.5)×N 이 순차 실행됐음. 여기에 sleep(30)이 더해져
+      실효 감시 간격이 45~90초. -8% 손절이 -18%, -21%에 체결된 원인.
+
+    이 스레드는 보유 종목만 스냅샷 1콜로 조회하므로 3초 주기가 가능.
+    신규 스캔이 아무리 느려도 손절 반응 속도에 영향을 주지 않음.
+    """
+    while True:
+        try:
+            if is_regular_session():
+                with state_lock:
+                    syms = list(sim_positions.keys())
+
+                if syms:
+                    # 네트워크 요청은 락 밖에서 (스캔 스레드를 불필요하게 막지 않도록)
+                    snaps = get_snapshots(syms)
+
+                    with state_lock:
+                        for sym in syms:
+                            # 락 대기 중 다른 스레드가 청산했을 수 있으므로 재확인
+                            if sym not in sim_positions:
+                                continue
+                            snap = snaps.get(sym)
+                            if not snap:
+                                continue
+                            price, src = get_live_price(snap)
+                            if price:
+                                check_sell_timing(sym, float(price), src)
+        except Exception as e:
+            # 감시 스레드는 절대 죽으면 안 됨 — 어떤 예외든 삼키고 계속 돈다
+            print(f"[감시 스레드 예외] {e}")
+
+        time.sleep(POSITION_CHECK_INTERVAL)
+
+
+# ──────────────────────────────────────────
 # 종목 분석
 # ──────────────────────────────────────────
 
-def analyze_regular(sym: str, snap: dict):
-    bars = get_bars(sym)
+def analyze_regular(sym: str, snap: dict, bars: list = None):
+    # [v32] bars를 인자로 받아 재사용. ATR 재정렬 단계에서 이미 조회한 걸
+    # 여기서 또 부르던 중복 API 콜(스캔당 최대 30콜) 제거.
+    if bars is None:
+        bars = get_bars(sym)
     if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
@@ -742,15 +859,16 @@ def check_scheduled_reports():
         market_close_sent = True
 
         # [v25] 보유 종목 전량 현재가로 강제 청산
-        if sim_positions:
-            held = list(sim_positions.keys())
-            snaps = get_snapshots(held)
-            for sym in held:
-                snap = snaps.get(sym, {})
-                price, _ = get_live_price(snap)
-                if price:
-                    sim_close(sym, float(price), "장마감 강제청산", qty=None)
-                    print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
+        with state_lock:
+            if sim_positions:
+                held = list(sim_positions.keys())
+                snaps = get_snapshots(held)
+                for sym in held:
+                    snap = snaps.get(sym, {})
+                    price, _ = get_live_price(snap)
+                    if price:
+                        sim_close(sym, float(price), "장마감 강제청산", qty=None)
+                        print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
 
         print("[📊 장마감 최종 매매일지 전송]")
         send_telegram(build_trade_report("🔔 장 종료 최종 매매일지"))
@@ -774,6 +892,8 @@ def check_scheduled_reports():
 # ──────────────────────────────────────────
 
 def run_scan():
+    # [v32] 보유 종목 손절/트레일링 체크 로직은 position_monitor_loop()로 이전.
+    # 이 함수는 이제 신규 진입 탐색만 담당한다.
     symbols = get_active_symbols()
     if not symbols:
         return
@@ -785,36 +905,16 @@ def run_scan():
         return
 
     now_utc = datetime.now(timezone.utc)
-    now_kst = now_utc + timedelta(hours=9)
-
-    snap_map = {s["symbol"]: s for s in ranked}
-
-    # ── [v24] 보유 종목 독립 가격 체크 ──
-    # snap_map에 없는 보유 종목도 별도 스냅샷 조회하여 손절/매도 체크
-    held_syms_not_in_scan = [
-        sym for sym in list(entry_prices.keys()) if sym not in snap_map
-    ]
-    if held_syms_not_in_scan:
-        extra_snaps = get_snapshots(held_syms_not_in_scan)
-        for sym, snap in extra_snaps.items():
-            price, source = get_live_price(snap)
-            if price:
-                check_sell_timing(sym, float(price), source)
-        print(f"  [보유종목 독립체크] {held_syms_not_in_scan} — {len(held_syms_not_in_scan)}개")
-
-    # 스캔 대상에 있는 보유 종목 체크
-    for sym in list(entry_prices.keys()):
-        if sym in snap_map:
-            stock = snap_map[sym]
-            check_sell_timing(sym, stock["price"], stock["price_source"])
 
     top = ranked[:REGULAR_TOP_N]
     print(f"[정규장] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
-    print(f"  {holdings_block().replace(chr(10), ' | ')}")
+    with state_lock:
+        print(f"  {holdings_block().replace(chr(10), ' | ')}")
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
 
-    # [v31] 일일 리스크 게이트 확인 — 막혀 있으면 신규매수 스킵(보유분 관리는 위에서 이미 수행)
+    # [v31] 일일 리스크 게이트 확인 — 막혀 있으면 신규매수 스킵
+    # (보유분 관리는 감시 스레드가 계속 수행하므로 여기서 return해도 안전)
     can_buy, lock_reason = buys_allowed()
     if not can_buy:
         print(f"  [🔒 신규매수 중단] {lock_reason} (당일 {daily_pnl_pct():+.2f}%) — 보유분 관리만 진행")
@@ -828,7 +928,8 @@ def run_scan():
             continue
         bars = get_bars(sym)
         atr  = calc_atr(bars) if bars else 0.0
-        top_with_atr.append({**stock, "_atr": atr})
+        # [v32] bars를 함께 실어 보내 analyze_regular에서 재조회하지 않게 함
+        top_with_atr.append({**stock, "_atr": atr, "_bars": bars})
 
     top_with_atr.sort(key=lambda x: x["_atr"], reverse=True)
     print(f"  [ATR 재정렬] " + " | ".join(
@@ -847,25 +948,31 @@ def run_scan():
                 continue
 
         print(f"  [{sym}] 분석 중...")
-        result = analyze_regular(sym, stock["snap"])
+        result = analyze_regular(sym, stock["snap"], stock.get("_bars"))
         if result is None:
             continue
 
-        last_alert[sym] = now_utc
-        entry_prices[sym] = {
-            "entry": stock["price"], "time": now_utc,
-            "alert1": None, "stop": None,
-            "sideways_done": False, "peak": 0.0,   # [v31] peak 추적 추가
-        }
-
-        # 매수 제한 체크
+        # [v32] 매수 제한 체크를 entry_prices 등록보다 먼저.
         if bought_this_scan >= MAX_BUY_PER_SCAN:
             print(f"  [매수 제한] {sym} — 이번 스캔 {MAX_BUY_PER_SCAN}종목 초과, 스킵")
             continue
 
-        bought = sim_open(sym, stock["price"])
-        if bought:
-            bought_this_scan += 1
+        # [v32] 유령 진입 제거:
+        # 기존엔 sim_open 성공 여부와 무관하게 entry_prices에 먼저 등록해서,
+        # 실제로 사지 않은 종목(슬롯 풀/예수금 부족/블랙리스트)이 감시 대상에 남았음.
+        # 이제 매수에 성공한 종목만 등록한다.
+        with state_lock:
+            bought = sim_open(sym, stock["price"])
+            if not bought:
+                continue
+
+            bought_this_scan  += 1
+            last_alert[sym]    = now_utc
+            entry_prices[sym]  = {
+                "entry": stock["price"], "time": datetime.now(timezone.utc),
+                "alert1": None, "stop": None,
+                "sideways_done": False, "peak": 0.0,   # [v31] peak 추적
+            }
 
         print(
             f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
@@ -882,25 +989,33 @@ def main():
     global market_close_sent, daily_start_pnl, daily_start_cash
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v31 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v32 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차(절반) | 트레일링(고점 +{TRAIL_ACTIVATE_PCT}% 활성, -{TRAIL_GAP_PCT}%p 갭) | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% (트레일링 미활성 종목만)")
-    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목 | 폴링 {CHECK_INTERVAL}초")
+    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
+    print(f"👁 [v32] 보유 감시 {POSITION_CHECK_INTERVAL}초 (독립 스레드) | 신규 스캔 {SCAN_INTERVAL}초")
     print(f"🔒 일일 게이트: +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도 (신규매수 중단)")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v31 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v32 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
         f"🎯 +{SELL_PARTIAL_PCT}% 1차(절반) → 트레일링(고점 +{TRAIL_ACTIVATE_PCT}%, -{TRAIL_GAP_PCT}%p) | {STOP_LOSS_PCT}% 손절\n"
-        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 폴링 {CHECK_INTERVAL}초\n"
+        f"📦 동시 보유 최대 {MAX_POSITIONS}종목\n"
+        f"👁 <b>[v32] 보유 감시 {POSITION_CHECK_INTERVAL}초 (스레드 분리)</b> | 스캔 {SCAN_INTERVAL}초\n"
+        f"🩺 손절 슬리피지 추적 기능 추가\n"
         f"🔒 당일 +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
+
+    # [v32] 보유 종목 감시 스레드 기동. daemon=True라 메인이 죽으면 같이 종료됨.
+    monitor = threading.Thread(target=position_monitor_loop, daemon=True, name="pos-monitor")
+    monitor.start()
+    print(f"👁 [v32] 보유 종목 감시 스레드 시작 ({POSITION_CHECK_INTERVAL}초 주기)")
 
     while True:
         now_str = datetime.now().strftime('%H:%M:%S')
@@ -915,6 +1030,7 @@ def main():
                 daily_start_cash = sim_stats["cash"]
                 print(f"[리셋] 장마감 플래그 초기화 | 일일게이트 기준 갱신 "
                       f"(기준자본 ${daily_start_cash:.2f})")
+                slippage_log.clear()   # [v32] 슬리피지 로그도 일단위 리셋
             if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
@@ -925,10 +1041,14 @@ def main():
         if not is_regular_session():
             print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
         else:
+            scan_start = time.time()
             print(f"\n[{now_str}] 정규장 스캔 시작")
             run_scan()
+            # [v32] 스캔 소요시간 로깅 — 중복 get_bars 제거 효과 확인용.
+            # 감시가 스레드로 분리됐으므로 이 값이 커져도 손절 반응 속도와는 무관.
+            print(f"  [스캔 소요] {time.time() - scan_start:.1f}초")
 
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":
