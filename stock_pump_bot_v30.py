@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v33 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 내부 시뮬레이션 봇 v34 (정규장 전용 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -36,7 +36,6 @@
      - 1주 절반익절 버그 (max(1, qty//2) → 1주면 전량청산)
      - 스프레드/유동성 필터
      - ATR 기반 사이징
-     - 서머타임 처리 (get_et_now UTC-4 하드코딩, 11월에 깨짐)
      → 위 4개 효과를 하루 확인한 뒤 v33에서 적용할 것.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -70,20 +69,30 @@
   6) trade_log 일단위 초기화. 기존엔 한 번도 안 지워서 매매일지에
      며칠치 거래가 누적 출력되고 있었음.
 
-  ※ 여전히 안 바꾼 것: 서머타임 (get_et_now UTC-4 하드코딩) — 11월 전에 처리.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[v34] 내부 시뮬레이션 회계·복원 안정화
+  1) 최초수량/누적매도/남은수량/총원가/누적실현손익을 포지션별로 분리 관리.
+  2) 초과·0주 매도 차단, 최종 승패는 포지션 전체 누적손익으로 판정.
+  3) 매수·매도 직후 가상계좌 상태를 홈 디렉터리 JSON 파일에 원자적으로 저장.
+  4) 재시작 시 현금·포지션·통계·거래일지·감시기준을 복원.
+  5) stale/비정상 가격 청산 및 한 번의 가격 확인 내 중복 청산 방지.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
+import json
 import time
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+ET_ZONE = ZoneInfo("America/New_York")
 
 # 정규장 조건
 REGULAR_TOP_N        = 30
@@ -143,6 +152,7 @@ state_lock = threading.RLock()
 # 시뮬레이션 상태
 # ──────────────────────────────────────────
 SIM_INITIAL_CASH = 100.0
+SIM_STATE_FILE = os.path.expanduser("~/stock_pump_v34_sim_state.json")
 # [v30] 예수금 배분: 남은 슬롯(MAX_POSITIONS - 현재보유) 균등 분배 방식으로 전환
 
 sim_positions: dict = {}
@@ -164,7 +174,7 @@ daily_start_cash: float = SIM_INITIAL_CASH
 # [v23] 종목당 손절 횟수 제한으로 전환
 # stop_loss_count[sym] = 당일 손절 횟수, MAX_STOP_LOSS_COUNT 도달 시 당일 블랙리스트
 stop_loss_count: dict = {}
-MAX_STOP_LOSS_COUNT = 2   # 2회까지는 재진입 허용, 3회째 손절부터 당일 차단
+MAX_STOP_LOSS_COUNT = 2   # 2회 도달 즉시 당일 차단
 
 # 손절 횟수가 MAX_STOP_LOSS_COUNT 이상 도달한 종목 (실질 블랙리스트)
 blacklisted_today: set = set()
@@ -178,6 +188,179 @@ market_close_sent: bool    = False
 
 # [v32] 슬리피지 진단용 — 손절 트리거 시 실제 체결 괴리 기록
 slippage_log: list = []
+
+
+def _position_remaining_qty(pos: dict) -> int:
+    """v33 상태와 v34 상태를 모두 읽을 수 있는 남은 수량 접근자."""
+    return max(int(pos.get("remaining_qty", pos.get("qty", 0)) or 0), 0)
+
+
+def _normalize_position(pos: dict) -> dict:
+    """v33 포지션을 포함해 v34 회계 필드가 빠진 상태를 안전하게 보정."""
+    remaining = _position_remaining_qty(pos)
+    initial = max(int(pos.get("initial_qty", remaining) or remaining), remaining)
+    sold = max(int(pos.get("sold_qty", initial - remaining) or 0), 0)
+    entry = float(pos.get("entry", 0) or 0)
+    total_cost = float(pos.get("total_cost", entry * initial) or 0)
+    pos.update({
+        "qty": remaining,
+        "initial_qty": initial,
+        "remaining_qty": remaining,
+        "total_cost": total_cost,
+        "realized_pnl": float(pos.get("realized_pnl", 0.0) or 0.0),
+        "sold_qty": sold,
+        "partial_done": bool(pos.get("partial_done", sold > 0)),
+    })
+    return pos
+
+
+def _serialize_entry_prices() -> dict:
+    data = {}
+    for sym, entry in entry_prices.items():
+        row = dict(entry)
+        for key in ("time", "alert1", "stop"):
+            value = row.get(key)
+            if isinstance(value, datetime):
+                row[key] = value.isoformat()
+        data[sym] = row
+    return data
+
+
+def _parse_datetime(value):
+    if not value or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def save_sim_state():
+    """가상계좌 상태를 같은 디렉터리 임시 파일에 쓴 뒤 원자적으로 교체."""
+    state_dir = os.path.dirname(SIM_STATE_FILE) or "."
+    tmp_path = f"{SIM_STATE_FILE}.tmp"
+    payload = {
+        "version": 34,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "sim_positions": sim_positions,
+        "sim_stats": sim_stats,
+        "trade_log": trade_log,
+        "entry_prices": _serialize_entry_prices(),
+        "stop_loss_count": stop_loss_count,
+        "blacklisted_today": sorted(blacklisted_today),
+        "slippage_log": slippage_log,
+        "daily_start_pnl": daily_start_pnl,
+        "daily_start_cash": daily_start_cash,
+    }
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SIM_STATE_FILE)
+    except Exception as e:
+        print(f"[상태 저장 실패] {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def reset_sim_state_in_memory():
+    """상태 파일이 없거나 손상됐을 때 사용하는 안전한 초기 상태."""
+    global daily_start_pnl, daily_start_cash
+    sim_positions.clear()
+    entry_prices.clear()
+    trade_log.clear()
+    stop_loss_count.clear()
+    blacklisted_today.clear()
+    slippage_log.clear()
+    sim_stats.clear()
+    sim_stats.update({
+        "initial_cash": SIM_INITIAL_CASH,
+        "cash": SIM_INITIAL_CASH,
+        "total_pnl": 0.0,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+    })
+    daily_start_pnl = 0.0
+    daily_start_cash = SIM_INITIAL_CASH
+
+
+def load_sim_state() -> bool:
+    """저장 상태를 복원. 파일 없음/손상 시 초기 상태로 계속 실행."""
+    global daily_start_pnl, daily_start_cash
+    if not os.path.exists(SIM_STATE_FILE):
+        reset_sim_state_in_memory()
+        print(f"[상태 복원] 저장 파일 없음 — ${SIM_INITIAL_CASH:.2f} 초기 상태")
+        return False
+    try:
+        with open(SIM_STATE_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+        positions = payload.get("sim_positions", {})
+        stats = payload.get("sim_stats", {})
+        logs = payload.get("trade_log", [])
+        entries = payload.get("entry_prices", {})
+        if not isinstance(positions, dict) or not isinstance(stats, dict) or not isinstance(logs, list):
+            raise ValueError("상태 파일 구조가 올바르지 않음")
+
+        sim_positions.clear()
+        for sym, pos in positions.items():
+            if isinstance(pos, dict):
+                sim_positions[sym] = _normalize_position(pos)
+
+        sim_stats.clear()
+        sim_stats.update({
+            "initial_cash": float(stats.get("initial_cash", SIM_INITIAL_CASH)),
+            "cash": max(float(stats.get("cash", SIM_INITIAL_CASH)), 0.0),
+            "total_pnl": float(stats.get("total_pnl", 0.0)),
+            "trades": int(stats.get("trades", 0)),
+            "wins": int(stats.get("wins", 0)),
+            "losses": int(stats.get("losses", 0)),
+        })
+        trade_log.clear()
+        trade_log.extend(logs)
+
+        entry_prices.clear()
+        for sym, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            row = dict(entry)
+            for key in ("time", "alert1", "stop"):
+                row[key] = _parse_datetime(row.get(key))
+            entry_prices[sym] = row
+
+        # 포지션은 있는데 감시기준이 누락된 구버전 상태도 복원 가능하게 보정.
+        for sym, pos in sim_positions.items():
+            entry_prices.setdefault(sym, {
+                "entry": pos["entry"],
+                "time": datetime.now(timezone.utc),
+                "alert1": None,
+                "stop": None,
+                "sideways_done": False,
+                "peak": 0.0,
+            })
+
+        stop_loss_count.clear()
+        stop_loss_count.update({
+            str(k): int(v) for k, v in payload.get("stop_loss_count", {}).items()
+        })
+        blacklisted_today.clear()
+        blacklisted_today.update(payload.get("blacklisted_today", []))
+        slippage_log.clear()
+        slippage_log.extend(payload.get("slippage_log", []))
+        daily_start_pnl = float(payload.get("daily_start_pnl", sim_stats["total_pnl"]))
+        daily_start_cash = max(float(payload.get("daily_start_cash", sim_stats["cash"])), 0.0)
+        print(f"[상태 복원] 현금 ${sim_stats['cash']:.2f} | 포지션 {len(sim_positions)}개 "
+              f"| 누적손익 ${sim_stats['total_pnl']:+.2f}")
+        return True
+    except Exception as e:
+        print(f"[상태 복원 실패] {e} — ${SIM_INITIAL_CASH:.2f} 초기 상태로 시작")
+        reset_sim_state_in_memory()
+        return False
 
 
 # ──────────────────────────────────────────
@@ -231,26 +414,31 @@ def send_telegram(message: str):
         _send_telegram_chunk(chunk)
 
 
-def get_et_now():
-    return datetime.now(timezone.utc) + timedelta(hours=-4)
+def get_et_now(now_utc: datetime = None):
+    """미국 동부시간. America/New_York 규칙에 따라 EST/EDT를 자동 적용."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    return now_utc.astimezone(ET_ZONE)
 
 
-def is_regular_session() -> bool:
-    now_et = get_et_now()
+def is_regular_session(now_utc: datetime = None) -> bool:
+    now_et = get_et_now(now_utc)
     et_min = now_et.hour * 60 + now_et.minute
     if now_et.weekday() >= 5:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
 
 
-def in_open_blackout() -> bool:
+def in_open_blackout(now_utc: datetime = None) -> bool:
     """
     [v33] 개장 직후 OPEN_BLACKOUT_MIN분은 신규 진입 금지.
     7/16 진입 5건이 전부 개장 5분 안에 몰렸고 그중 4건이 손절.
     개장 직후는 스프레드가 가장 넓고 스냅샷 데이터가 가장 부정확하다.
     (보유분 청산은 이 게이트와 무관하게 계속 동작)
     """
-    now_et = get_et_now()
+    now_et = get_et_now(now_utc)
     et_min = now_et.hour * 60 + now_et.minute
     open_min = 9 * 60 + 30
     return open_min <= et_min < (open_min + OPEN_BLACKOUT_MIN)
@@ -290,19 +478,28 @@ def holdings_block(current_prices: dict = None) -> str:
         return "📭 <b>보유 종목:</b> 없음"
     lines = ["📦 <b>보유 종목:</b>"]
     for sym, pos in sim_positions.items():
+        _normalize_position(pos)
         status = "1차완료" if pos["partial_done"] else "전량보유"
+        initial_qty = pos["initial_qty"]
+        sold_qty = pos["sold_qty"]
+        remaining_qty = pos["remaining_qty"]
+        realized = pos["realized_pnl"]
         if current_prices and sym in current_prices:
             cur   = current_prices[sym]
             pnl_pct = ((cur - pos["entry"]) / pos["entry"]) * 100
-            pnl_amt = (cur - pos["entry"]) * pos["qty"]
+            pnl_amt = (cur - pos["entry"]) * remaining_qty
             icon  = "📈" if pnl_pct >= 0 else "📉"
             lines.append(
-                f"  • {naver_link(sym)} {pos['qty']}주 @ ${pos['entry']:.2f} [{status}]\n"
-                f"    {icon} 현재 ${cur:.2f} ({pnl_pct:+.2f}%, {pnl_amt:+.2f}$)"
+                f"  • {naver_link(sym)} 최초 {initial_qty}주 / 매도 {sold_qty}주 / "
+                f"잔여 {remaining_qty}주 @ ${pos['entry']:.2f} [{status}]\n"
+                f"    💵 실현 {realized:+.2f}$ | {icon} 미실현 {pnl_amt:+.2f}$ "
+                f"({pnl_pct:+.2f}%, 현재 ${cur:.2f})"
             )
         else:
             lines.append(
-                f"  • {naver_link(sym)} {pos['qty']}주 @ ${pos['entry']:.2f} [{status}]"
+                f"  • {naver_link(sym)} 최초 {initial_qty}주 / 매도 {sold_qty}주 / "
+                f"잔여 {remaining_qty}주 @ ${pos['entry']:.2f} [{status}] "
+                f"| 실현 {realized:+.2f}$"
             )
     return "\n".join(lines)
 
@@ -376,9 +573,16 @@ def build_trade_report(title: str) -> str:
                     f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 매수 @ ${t['price']:.2f}"
                 )
             else:
+                position_note = ""
+                if "position_realized_pnl" in t:
+                    position_note = (
+                        f" | 누적 {t['position_realized_pnl']:+.2f}$"
+                        f" / 잔여 {t.get('remaining_qty', 0)}주"
+                    )
                 lines.append(
                     f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 {t['reason']} "
-                    f"@ ${t['price']:.2f} ({t['pnl']:+.2f}$, {t['pnl_pct']:+.2f}%)"
+                    f"@ ${t['price']:.2f} ({t['pnl']:+.2f}$, {t['pnl_pct']:+.2f}%"
+                    f"{position_note})"
                 )
     else:
         lines.append("📝 거래 내역: 없음")
@@ -419,7 +623,10 @@ def build_trade_report(title: str) -> str:
 # ──────────────────────────────────────────
 
 def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
-    """매수 신호 → 남은 슬롯 균등 분배 + [v33] ATR 기반 리스크 사이징."""
+    """매수 신호 → 남은 슬롯 균등 분배 + ATR 기반 리스크 사이징."""
+    if not price or price <= 0:
+        print(f"  [시뮬 매수 불가] {sym} 유효하지 않은 가격: {price}")
+        return False
     if sym in sim_positions:
         return False
     if sym in blacklisted_today:
@@ -436,7 +643,9 @@ def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
 
     # ── [v33] ATR 기반 리스크 사이징 ──
     # 자본 = 예수금 + 보유 포지션 평가액(진입가 기준)
-    capital = sim_stats["cash"] + sum(p["entry"] * p["qty"] for p in sim_positions.values())
+    capital = sim_stats["cash"] + sum(
+        p["entry"] * _position_remaining_qty(p) for p in sim_positions.values()
+    )
 
     # 최악 손실 가정: 손절폭(-8%)을 그대로 믿지 않는다.
     # 변동성이 큰 종목은 손절선을 훌쩍 뛰어넘어 체결되므로 ATR% × 배수로 보수적 가정.
@@ -452,7 +661,7 @@ def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
     allowed = min(budget, risk_notional, cap_notional)
     qty     = int(allowed // price)
 
-    if qty < MIN_QTY:
+    if qty <= 1 or qty < MIN_QTY:
         print(f"  [시뮬 매수 불가] {sym} @ ${price:.2f} | qty={qty} < {MIN_QTY}"
               f" (슬롯예산 ${budget:.1f} / 리스크상한 ${risk_notional:.1f}"
               f" / 종목상한 ${cap_notional:.1f} | ATR {atr_pct:.1f}%,"
@@ -460,8 +669,26 @@ def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
         return False
 
     cost = price * qty
-    sim_stats["cash"] -= cost
-    sim_positions[sym] = {"entry": price, "qty": qty, "partial_done": False}
+    if cost > sim_stats["cash"] + 1e-9:
+        print(f"  [시뮬 매수 불가] {sym} | 매수금액 ${cost:.2f} > 가상현금 ${sim_stats['cash']:.2f}")
+        return False
+
+    next_cash = sim_stats["cash"] - cost
+    if next_cash < -1e-9:
+        print(f"  [시뮬 매수 불가] {sym} | 현금 음수 방지 ({next_cash:.4f})")
+        return False
+
+    sim_stats["cash"] = max(next_cash, 0.0)
+    sim_positions[sym] = {
+        "entry": price,
+        "qty": qty,  # v33 호환 필드. remaining_qty와 항상 동기화.
+        "initial_qty": qty,
+        "remaining_qty": qty,
+        "total_cost": cost,
+        "realized_pnl": 0.0,
+        "sold_qty": 0,
+        "partial_done": False,
+    }
     now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
     trade_log.append({
         "action": "BUY", "sym": sym, "qty": qty, "price": price,
@@ -472,6 +699,7 @@ def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
           f"(자본 대비 {cost / capital * 100:.0f}% | ATR {atr_pct:.1f}%, "
           f"최악손실가정 {assumed_loss:.1f}%, 남은슬롯 {remaining_slots}) "
           f"| 잔여: ${sim_stats['cash']:.2f}")
+    save_sim_state()
     return True
 
 
@@ -486,35 +714,53 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     if not pos:
         return ""
 
+    _normalize_position(pos)
+    if not exit_price or exit_price <= 0:
+        print(f"  [시뮬 매도 거부] {sym} 유효하지 않은 가격: {exit_price}")
+        return ""
+
     entry_price = pos["entry"]   # 청산 전에 미리 저장
-    close_qty   = qty if qty is not None else pos["qty"]
+    remaining_qty = pos["remaining_qty"]
+    close_qty = remaining_qty if qty is None else int(qty)
+    if close_qty <= 0:
+        print(f"  [시뮬 매도 거부] {sym} close_qty={close_qty} (0 이하)")
+        return ""
+    if close_qty > remaining_qty:
+        print(f"  [시뮬 매도 거부] {sym} 요청 {close_qty}주 > 보유 {remaining_qty}주")
+        return ""
+
+    proceeds    = exit_price * close_qty
     pnl         = (exit_price - entry_price) * close_qty
     pnl_pct     = ((exit_price - entry_price) / entry_price) * 100
 
-    sim_stats["cash"] += exit_price * close_qty
-    pos["qty"] -= close_qty
+    sim_stats["cash"] += proceeds
+    pos["sold_qty"] += close_qty
+    pos["remaining_qty"] = max(remaining_qty - close_qty, 0)
+    pos["qty"] = pos["remaining_qty"]
+    pos["realized_pnl"] += pnl
+    sim_stats["total_pnl"] += pnl
 
-    if pos["qty"] <= 0:
+    if pos["remaining_qty"] == 0:
+        position_total_pnl = pos["realized_pnl"]
         del sim_positions[sym]
         # [v32] 포지션이 완전히 닫혔으면 entry_prices도 같이 제거.
         # 기존엔 남아 있어서 (a) 청산된 종목이 매 스캔마다 API 조회 대상이 되고
         # (b) check_sell_timing이 옛 진입가로 계속 돌아 스캔이 날이 갈수록 느려짐 → 슬리피지 악화.
         entry_prices.pop(sym, None)
-        sim_stats["total_pnl"] += pnl
         sim_stats["trades"]    += 1
-        if pnl >= 0:
+        if position_total_pnl >= 0:
             sim_stats["wins"]   += 1
         else:
             sim_stats["losses"] += 1
     else:
         pos["partial_done"]     = True
-        sim_stats["total_pnl"] += pnl
+        position_total_pnl = pos["realized_pnl"]
 
     # [v23] 손절 시 카운트 증가, 허용 횟수(MAX_STOP_LOSS_COUNT) 도달 시에만 블랙리스트 등록
     if "손절" in reason:
         stop_loss_count[sym] = stop_loss_count.get(sym, 0) + 1
         cnt = stop_loss_count[sym]
-        if cnt > MAX_STOP_LOSS_COUNT:
+        if cnt >= MAX_STOP_LOSS_COUNT:
             blacklisted_today.add(sym)
             print(f"  [블랙리스트 등록] {sym} — 손절 {cnt}회 누적, 당일 재진입 금지")
         else:
@@ -533,8 +779,11 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     trade_log.append({
         "action": "SELL", "sym": sym, "qty": close_qty, "price": exit_price,
         "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+        "position_realized_pnl": position_total_pnl,
+        "remaining_qty": pos["remaining_qty"] if sym in sim_positions else 0,
         "time_kst": now_kst.strftime("%H:%M"),
     })
+    save_sim_state()
 
     win_rate         = (
         sim_stats["wins"] / sim_stats["trades"] * 100
@@ -542,7 +791,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     )
     total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
 
-    bl_note = f"\n🚫 {sym} 당일 블랙리스트 등록" if "손절" in reason else ""
+    bl_note = f"\n🚫 {sym} 당일 블랙리스트 등록" if sym in blacklisted_today else ""
 
     summary = (
         f"\n\n💹 <b>[시뮬레이션]</b>\n"
@@ -551,6 +800,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         f"📥 진입가: ${entry_price:.2f}\n"
         f"{'📈' if pnl >= 0 else '📉'} 건별 손익: "
         f"<b>{'+' if pnl >= 0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
+        f"🧾 포지션 누적 실현손익: <b>{position_total_pnl:+.2f}$</b>\n"
         f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
         f"💰 누적 손익: <b>{'+' if sim_stats['total_pnl'] >= 0 else ''}"
         f"{sim_stats['total_pnl']:.2f}$</b> (<b>{total_return_pct:+.2f}%</b>)\n"
@@ -826,9 +1076,19 @@ def build_ranked(snapshots: dict):
 # 매도 타이밍 체크
 # ──────────────────────────────────────────
 
-def check_sell_timing(sym: str, current_price: float, price_source: str):
+def check_sell_timing(sym: str, current_price: float, price_source: str, stale_sec: float = None):
     if sym not in entry_prices:
         return
+    if not current_price or current_price <= 0:
+        print(f"  [청산 판단 스킵] {sym} 유효하지 않은 {price_source} 가격: {current_price}")
+        return
+    if price_source == "bid" and stale_sec is None:
+        print(f"  [청산 판단 스킵] {sym} bid 타임스탬프 없음")
+        return
+    if stale_sec is not None and stale_sec > DATA_STALE_WARN_SEC:
+        print(f"  [청산 판단 스킵] {sym} stale {price_source} {stale_sec:.0f}초")
+        return
+
     entry       = entry_prices[sym]
     entry_price = entry["entry"]
     now_utc     = datetime.now(timezone.utc)
@@ -838,6 +1098,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     # [v31] 고점(peak) 갱신 — 트레일링 스톱 기준
     if gain_pct > entry.get("peak", 0.0):
         entry["peak"] = gain_pct
+        save_sim_state()
     peak = entry.get("peak", 0.0)
 
     def cooldown_ok(key):
@@ -849,31 +1110,40 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     # ── 손절 (-8%) ──
     if gain_pct <= STOP_LOSS_PCT:
         if cooldown_ok("stop"):
-            entry["stop"] = now_utc
             if sym in sim_positions:
-                sim_close(sym, current_price, "손절(-8%)", qty=None)
-            print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+                closed = sim_close(sym, current_price, "손절(-8%)", qty=None)
+                if closed:
+                    entry["stop"] = now_utc
+                    print(f"[🔴 손절] {sym} | ${entry_price:.2f} → "
+                          f"${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
     # ── [v31] 트레일링 스톱 (고점 +6% 이상 활성화 & 고점 대비 -4%p 하락 시 전량 청산) ──
     if peak >= TRAIL_ACTIVATE_PCT and gain_pct <= (peak - TRAIL_GAP_PCT):
         if sym in sim_positions:
-            sim_close(sym, current_price, f"트레일링청산(고점{peak:+.1f}%)", qty=None)
-        print(f"[🟢 트레일링청산] {sym} | 고점 {peak:+.2f}% → 현재 {gain_pct:+.2f}% "
-              f"| ${entry_price:.2f} → ${current_price:.2f}")
+            closed = sim_close(sym, current_price, f"트레일링청산(고점{peak:+.1f}%)", qty=None)
+            if closed:
+                print(f"[🟢 트레일링청산] {sym} | 고점 {peak:+.2f}% → 현재 {gain_pct:+.2f}% "
+                      f"| ${entry_price:.2f} → ${current_price:.2f}")
         return
 
     # ── +7% 1차 매도 (절반 확보). 나머지는 트레일링이 관리 ──
     if gain_pct >= SELL_PARTIAL_PCT:
         if cooldown_ok("alert1"):
-            entry["alert1"] = now_utc
             pos = sim_positions.get(sym)
             if pos and not pos.get("partial_done"):
+                _normalize_position(pos)
                 # [v33] 1주 보유면 절반익절 스킵.
                 # 기존 max(1, qty//2)는 1주일 때 전량을 팔아버려 트레일링 기회를 없앰.
-                if pos["qty"] >= 2:
-                    sim_close(sym, current_price, "+7% 1차(절반)", qty=pos["qty"] // 2)
-                    print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+                remaining_qty = pos["remaining_qty"]
+                if remaining_qty >= 2:
+                    partial_qty = remaining_qty // 2
+                    closed = sim_close(
+                        sym, current_price, "+7% 1차(절반)", qty=partial_qty)
+                    if closed:
+                        entry["alert1"] = now_utc
+                        print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → "
+                              f"${current_price:.2f} ({gain_pct:+.2f}%)")
                 else:
                     print(f"  [1차매도 스킵] {sym} 1주 보유 — 트레일링에 위임 ({gain_pct:+.2f}%)")
         return
@@ -884,11 +1154,12 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             and elapsed_min >= SIDEWAYS_MINUTES
             and not entry.get("sideways_done")):
         if SIDEWAYS_MIN_PCT <= gain_pct < SIDEWAYS_MAX_PCT:
-            entry["sideways_done"] = True
             if sym in sim_positions:
-                sim_close(sym, current_price, "횡보청산", qty=None)
-            print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} "
-                  f"({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
+                closed = sim_close(sym, current_price, "횡보청산", qty=None)
+                if closed:
+                    entry["sideways_done"] = True
+                    print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} "
+                          f"({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
             return
 
 
@@ -933,7 +1204,7 @@ def position_monitor_loop():
                                 continue
                             if stale is not None and stale > DATA_STALE_WARN_SEC:
                                 print(f"  ⏱ [데이터 정체] {sym} — {src} 가격이 {stale:.0f}초 전 것")
-                            check_sell_timing(sym, float(price), src)
+                            check_sell_timing(sym, float(price), src, stale)
         except Exception as e:
             # 감시 스레드는 절대 죽으면 안 됨 — 어떤 예외든 삼키고 계속 돈다
             print(f"[감시 스레드 예외] {e}")
@@ -1031,8 +1302,14 @@ def check_scheduled_reports():
                 snaps = get_snapshots(held)
                 for sym in held:
                     snap = snaps.get(sym, {})
-                    price, _, _ = get_exit_price(snap)   # [v33] bid 기준
-                    if price:
+                    price, source, stale = get_exit_price(snap)   # [v33] bid 기준
+                    if source == "bid" and stale is None:
+                        print(f"  [장마감 청산 보류] {sym} bid 타임스탬프 없음")
+                        continue
+                    if stale is not None and stale > DATA_STALE_WARN_SEC:
+                        print(f"  [장마감 청산 보류] {sym} stale {source} {stale:.0f}초")
+                        continue
+                    if price and price > 0:
                         sim_close(sym, float(price), "장마감 강제청산", qty=None)
                         print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
 
@@ -1145,6 +1422,7 @@ def run_scan():
                 "alert1": None, "stop": None,
                 "sideways_done": False, "peak": 0.0,   # [v31] peak 추적
             }
+            save_sim_state()
 
         print(
             f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
@@ -1160,28 +1438,31 @@ def run_scan():
 def main():
     global market_close_sent, daily_start_pnl, daily_start_cash
 
+    load_sim_state()
     print("=" * 60)
-    print("🚀 급등 감지 봇 v33 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 내부 시뮬레이션 봇 v34 (정규장 전용 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
-    print(f"🩸 [v33] 청산 판단: 호가(bid) 기준 | 스프레드 ≤{MAX_SPREAD_PCT}% | 최소 {MIN_QTY}주")
-    print(f"⚖️  [v33] 사이징: 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}% | ATR×{ATR_LOSS_MULT} 손실가정")
-    print(f"⏳ [v33] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지")
+    print(f"🩸 [v34] 청산 판단: 호가(bid) 기준 | 스프레드 ≤{MAX_SPREAD_PCT}% | 최소 {MIN_QTY}주")
+    print(f"⚖️  [v34] 사이징: 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}% | ATR×{ATR_LOSS_MULT} 손실가정")
+    print(f"💾 [v34] 상태 저장: {SIM_STATE_FILE}")
+    print(f"⏳ [v34] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차(절반) | 트레일링(고점 +{TRAIL_ACTIVATE_PCT}% 활성, -{TRAIL_GAP_PCT}%p 갭) | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% (트레일링 미활성 종목만)")
     print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
     print(f"👁 [v32] 보유 감시 {POSITION_CHECK_INTERVAL}초 (독립 스레드) | 신규 스캔 {SCAN_INTERVAL}초")
     print(f"🔒 일일 게이트: +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도 (신규매수 중단)")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
-    print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
+    print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v33 시작!</b>\n"
+        f"🤖 <b>급등 감지 내부 시뮬레이션 봇 v34 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ | 스프레드 ≤{MAX_SPREAD_PCT}%\n"
         f"🎯 +{SELL_PARTIAL_PCT}% 1차(절반) → 트레일링(고점 +{TRAIL_ACTIVATE_PCT}%, -{TRAIL_GAP_PCT}%p) | {STOP_LOSS_PCT}% 손절\n"
-        f"🩸 <b>[v33] 청산 판단 = 호가(bid) 기준</b> (IEX 체결 정체 대응)\n"
-        f"⚖️ <b>[v33] ATR 사이징</b> — 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}%\n"
-        f"⏳ [v33] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지 | 최소 {MIN_QTY}주\n"
+        f"🩸 <b>[v34] 청산 판단 = 유효한 호가(bid) 기준</b> (stale 가격 청산 차단)\n"
+        f"⚖️ <b>[v34] ATR 사이징·포지션 회계 강화</b> — 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}%\n"
+        f"💾 재시작 시 가상 현금·포지션·손익 자동 복원\n"
+        f"⏳ [v34] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지 | 최소 {MIN_QTY}주\n"
         f"📦 동시 보유 최대 {MAX_POSITIONS}종목\n"
         f"👁 보유 감시 {POSITION_CHECK_INTERVAL}초 (스레드 분리) | 스캔 {SCAN_INTERVAL}초\n"
         f"🩺 손절 슬리피지 추적\n"
@@ -1213,10 +1494,12 @@ def main():
                 # 며칠치 거래가 통째로 누적 출력되고 있었음.
                 trade_log.clear()
                 print("[리셋] 매매일지 초기화 (전일 거래 내역 정리)")
+                save_sim_state()
             if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
                 print("[리셋] 블랙리스트 및 손절 카운트 초기화 (새 장 시작)")
+                save_sim_state()
 
         check_scheduled_reports()
 
