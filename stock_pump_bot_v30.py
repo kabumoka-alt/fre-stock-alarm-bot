@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v32 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v33 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -38,6 +38,39 @@
      - ATR 기반 사이징
      - 서머타임 처리 (get_et_now UTC-4 하드코딩, 11월에 깨짐)
      → 위 4개 효과를 하루 확인한 뒤 v33에서 적용할 것.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[v33] v32 실측 결과 반영
+
+  v32 실측(7/16): 손절 슬리피지 평균 초과 6.6%p → 3.5%p (NVVE 제외) 개선.
+  스레드 분리 효과 확인됨. 남은 3.5%p와 NVVE 참사(-52.95%)를 잡는다.
+
+  1) [핵심] 청산 판단 가격을 latestTrade(마지막 체결) → latestQuote의 bid로 변경.
+     Alpaca 무료 IEX 피드는 전체 거래의 2~3%만 포착. 얇은 종목은 몇 분간
+     체결이 안 잡혀 latestTrade가 얼어붙고, 감시 스레드가 3초마다 같은
+     옛 가격을 반복해서 읽는다. 폴링이 아니라 데이터가 정지한 것.
+     호가(bid)는 체결이 없어도 갱신되고, 매도 시 실제 받는 가격이라 더 정확.
+     + 호가 타임스탬프로 데이터 정체(staleness) 감지 및 경고.
+
+  2) ATR 기반 사이징. NVVE $21.83 1주 = 계좌의 22% → -53%에 계좌 -11.6% 직격.
+     1건 최악 손실이 자본의 MAX_RISK_PER_TRADE_PCT를 넘지 않게 수량 제한.
+     최악 손실은 max(손절폭, ATR% × ATR_LOSS_MULT)로 보수적 가정.
+     + MAX_POSITION_PCT: 단일 종목 명목가 상한 (사이징 실패 대비 백스톱)
+
+  3) 개장 직후 OPEN_BLACKOUT_MIN분 신규 진입 금지.
+     7/16 5건 전부 22:30~22:35(개장 5분) 진입 → 4건 손절. 개장 직후는
+     호가 스프레드가 가장 넓고 스냅샷이 가장 부정확한 구간.
+
+  4) 스프레드 필터: 호가 스프레드 MAX_SPREAD_PCT 초과 종목 진입 제외.
+
+  5) 1주 포지션 금지(MIN_QTY=2) + 절반익절 방어 코드.
+     기존 half = max(1, qty//2) 는 1주 보유 시 전량을 팔아버려 트레일링
+     기회를 없앰 (QTTB +8.4%, JLHL +11.5% 사례).
+
+  6) trade_log 일단위 초기화. 기존엔 한 번도 안 지워서 매매일지에
+     며칠치 거래가 누적 출력되고 있었음.
+
+  ※ 여전히 안 바꾼 것: 서머타임 (get_et_now UTC-4 하드코딩) — 11월 전에 처리.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -58,6 +91,15 @@ REGULAR_RSI          = 50
 PRICE_CHANGE_1M      = 3.0
 VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 기준
 MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
+
+# [v33] 진입 필터 / 사이징 / 데이터 품질
+MAX_SPREAD_PCT         = 1.0   # 호가 스프레드 상한(%) — 초과 시 진입 제외
+MIN_QTY                = 2     # 1주 포지션 금지 (절반익절이 전량청산이 되는 문제)
+MAX_RISK_PER_TRADE_PCT = 2.0   # 1건 최악 손실 = 자본의 2% 이내
+MAX_POSITION_PCT       = 25.0  # 단일 종목 명목가 상한 = 자본의 25% (백스톱)
+ATR_LOSS_MULT          = 2.5   # 최악 손실 가정 = ATR% × 이 배수 (갭 하락 대비)
+OPEN_BLACKOUT_MIN      = 5     # 개장 후 이 시간(분)까지 신규 진입 금지
+DATA_STALE_WARN_SEC    = 60    # 호가가 이 초 이상 갱신 안 되면 경고 로그
 
 # [v32] 스캔 주기와 보유 종목 감시 주기를 분리
 SCAN_INTERVAL           = 30  # 신규 종목 스캔 주기(초) — 기존 CHECK_INTERVAL
@@ -199,6 +241,19 @@ def is_regular_session() -> bool:
     if now_et.weekday() >= 5:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
+
+
+def in_open_blackout() -> bool:
+    """
+    [v33] 개장 직후 OPEN_BLACKOUT_MIN분은 신규 진입 금지.
+    7/16 진입 5건이 전부 개장 5분 안에 몰렸고 그중 4건이 손절.
+    개장 직후는 스프레드가 가장 넓고 스냅샷 데이터가 가장 부정확하다.
+    (보유분 청산은 이 게이트와 무관하게 계속 동작)
+    """
+    now_et = get_et_now()
+    et_min = now_et.hour * 60 + now_et.minute
+    open_min = 9 * 60 + 30
+    return open_min <= et_min < (open_min + OPEN_BLACKOUT_MIN)
 
 
 # ──────────────────────────────────────────
@@ -363,8 +418,8 @@ def build_trade_report(title: str) -> str:
 # 시뮬레이션 헬퍼
 # ──────────────────────────────────────────
 
-def sim_open(sym: str, price: float) -> bool:
-    """매수 신호 → 남은 슬롯 균등 분배 방식으로 매수 (예수금 ÷ 남은 슬롯)."""
+def sim_open(sym: str, price: float, atr: float = 0.0) -> bool:
+    """매수 신호 → 남은 슬롯 균등 분배 + [v33] ATR 기반 리스크 사이징."""
     if sym in sim_positions:
         return False
     if sym in blacklisted_today:
@@ -374,13 +429,36 @@ def sim_open(sym: str, price: float) -> bool:
     if len(sim_positions) >= MAX_POSITIONS:
         print(f"  [시뮬 매수 불가] {sym} — 보유 종목 {len(sim_positions)}개 (최대 {MAX_POSITIONS}개)")
         return False
+
     # [v30] 남은 슬롯에 예수금 균등 분배
     remaining_slots = MAX_POSITIONS - len(sim_positions)
     budget          = sim_stats["cash"] / remaining_slots
-    qty             = int(budget // price)
-    if qty < 1:
-        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={price:.2f})")
+
+    # ── [v33] ATR 기반 리스크 사이징 ──
+    # 자본 = 예수금 + 보유 포지션 평가액(진입가 기준)
+    capital = sim_stats["cash"] + sum(p["entry"] * p["qty"] for p in sim_positions.values())
+
+    # 최악 손실 가정: 손절폭(-8%)을 그대로 믿지 않는다.
+    # 변동성이 큰 종목은 손절선을 훌쩍 뛰어넘어 체결되므로 ATR% × 배수로 보수적 가정.
+    # (NVVE 사례: -8% 손절이 -52.95%에 체결)
+    atr_pct      = (atr / price * 100) if (atr and price > 0) else 0.0
+    assumed_loss = max(abs(STOP_LOSS_PCT), atr_pct * ATR_LOSS_MULT)
+
+    # 이 종목에 넣을 수 있는 최대 명목가 = 자본 × 허용리스크 ÷ 최악손실가정
+    risk_notional = capital * (MAX_RISK_PER_TRADE_PCT / 100) / (assumed_loss / 100)
+    # 백스톱: 사이징이 어떻게 나오든 단일 종목이 자본의 MAX_POSITION_PCT를 넘지 않게
+    cap_notional  = capital * (MAX_POSITION_PCT / 100)
+
+    allowed = min(budget, risk_notional, cap_notional)
+    qty     = int(allowed // price)
+
+    if qty < MIN_QTY:
+        print(f"  [시뮬 매수 불가] {sym} @ ${price:.2f} | qty={qty} < {MIN_QTY}"
+              f" (슬롯예산 ${budget:.1f} / 리스크상한 ${risk_notional:.1f}"
+              f" / 종목상한 ${cap_notional:.1f} | ATR {atr_pct:.1f}%,"
+              f" 최악손실가정 {assumed_loss:.1f}%)")
         return False
+
     cost = price * qty
     sim_stats["cash"] -= cost
     sim_positions[sym] = {"entry": price, "qty": qty, "partial_done": False}
@@ -390,7 +468,10 @@ def sim_open(sym: str, price: float) -> bool:
         "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
         "time_kst": now_kst.strftime("%H:%M"),
     })
-    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (슬롯예산={cost:.2f}, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
+    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} = ${cost:.2f} "
+          f"(자본 대비 {cost / capital * 100:.0f}% | ATR {atr_pct:.1f}%, "
+          f"최악손실가정 {assumed_loss:.1f}%, 남은슬롯 {remaining_slots}) "
+          f"| 잔여: ${sim_stats['cash']:.2f}")
     return True
 
 
@@ -648,8 +729,75 @@ def get_live_price(snap: dict):
     mb     = snap.get("minuteBar",   {})
     db     = snap.get("dailyBar",    {})
     price  = lt.get("p") or mb.get("c") or db.get("c")
-    source = "호가" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
+    source = "체결" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
     return price, source
+
+
+def parse_ts(ts: str):
+    """
+    [v33] Alpaca RFC3339 타임스탬프 파서.
+    나노초(9자리)가 붙어 오는데 fromisoformat은 마이크로초(6자리)까지만 받으므로 잘라낸다.
+    """
+    if not ts:
+        return None
+    try:
+        s = ts.replace("Z", "+00:00")
+        if "." in s:
+            head, rest = s.split(".", 1)
+            if "+" in rest:
+                frac, off = rest.split("+", 1)
+                off = "+" + off
+            else:
+                frac, off = rest, "+00:00"
+            s = f"{head}.{frac[:6]}{off}"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def spread_pct(snap: dict) -> float:
+    """
+    [v33] 호가 스프레드(%). 호가가 없거나 비정상이면 -1.0 반환(판단 불가).
+    """
+    q = snap.get("latestQuote") or {}
+    bid, ask = q.get("bp"), q.get("ap")
+    if not bid or not ask or bid <= 0 or ask <= bid:
+        return -1.0
+    return (ask - bid) / ((ask + bid) / 2) * 100
+
+
+def get_exit_price(snap: dict):
+    """
+    [v33] 청산 판단용 가격 — 호가(bid) 우선.
+
+    왜 bid인가:
+      Alpaca 무료 IEX 피드는 전체 거래의 2~3%만 포착한다. 얇은 종목은 몇 분간
+      IEX에 체결이 안 잡혀 latestTrade가 그대로 얼어붙고, 감시 스레드가 3초마다
+      같은 옛 가격을 반복해 읽는다. 그래서 -8% 손절이 -53%에 체결됐다.
+      호가는 체결이 없어도 계속 갱신되고, 매도 시 실제로 받는 가격이 bid이므로
+      손절 판단에 더 정확하고 보수적이다.
+
+    반환: (price, source, stale_sec)
+      stale_sec: 이 가격이 몇 초 전 것인지 (판단 불가 시 None)
+    """
+    q = snap.get("latestQuote") or {}
+    bid, ask = q.get("bp"), q.get("ap")
+
+    stale_sec = None
+    ts = parse_ts(q.get("t"))
+    if ts:
+        stale_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+
+    # 정상 호가(교차/역전 아님)면 bid 사용
+    if bid and ask and bid > 0 and ask > bid:
+        return float(bid), "bid", stale_sec
+
+    # 호가가 없으면 기존 방식으로 폴백
+    price, src = get_live_price(snap)
+    lt_ts = parse_ts((snap.get("latestTrade") or {}).get("t"))
+    if lt_ts:
+        stale_sec = (datetime.now(timezone.utc) - lt_ts).total_seconds()
+    return (float(price) if price else None), src, stale_sec
 
 
 def build_ranked(snapshots: dict):
@@ -721,9 +869,13 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             entry["alert1"] = now_utc
             pos = sim_positions.get(sym)
             if pos and not pos.get("partial_done"):
-                half = max(1, pos["qty"] // 2)
-                sim_close(sym, current_price, "+7% 1차(절반)", qty=half)
-            print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+                # [v33] 1주 보유면 절반익절 스킵.
+                # 기존 max(1, qty//2)는 1주일 때 전량을 팔아버려 트레일링 기회를 없앰.
+                if pos["qty"] >= 2:
+                    sim_close(sym, current_price, "+7% 1차(절반)", qty=pos["qty"] // 2)
+                    print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+                else:
+                    print(f"  [1차매도 스킵] {sym} 1주 보유 — 트레일링에 위임 ({gain_pct:+.2f}%)")
         return
 
     # ── [v31] 횡보 청산 완화: 트레일링 미활성(고점<활성임계) & 10분 경과 & +3~+6% 구간만 ──
@@ -775,9 +927,13 @@ def position_monitor_loop():
                             snap = snaps.get(sym)
                             if not snap:
                                 continue
-                            price, src = get_live_price(snap)
-                            if price:
-                                check_sell_timing(sym, float(price), src)
+                            # [v33] 체결가 대신 호가(bid) 기준으로 청산 판단
+                            price, src, stale = get_exit_price(snap)
+                            if not price:
+                                continue
+                            if stale is not None and stale > DATA_STALE_WARN_SEC:
+                                print(f"  ⏱ [데이터 정체] {sym} — {src} 가격이 {stale:.0f}초 전 것")
+                            check_sell_timing(sym, float(price), src)
         except Exception as e:
             # 감시 스레드는 절대 죽으면 안 됨 — 어떤 예외든 삼키고 계속 돈다
             print(f"[감시 스레드 예외] {e}")
@@ -805,6 +961,16 @@ def analyze_regular(sym: str, snap: dict, bars: list = None):
     if current_price < MIN_PRICE:
         print(f"  └ 저가주 제외: ${current_price:.2f} < ${MIN_PRICE}")
         return None
+
+    # [v33] 스프레드 필터 — 호가가 벌어진 종목은 손절이 미끄러진다.
+    # 호가가 아예 없으면(IEX 미포착) 차단하지 않고 경고만 (fail-open).
+    # 하루 로그에서 "호가 없음"이 드물면 fail-close(return None)로 바꿀 것.
+    sp = spread_pct(snap)
+    if sp > MAX_SPREAD_PCT:
+        print(f"  └ 스프레드 제외: {sp:.2f}% > {MAX_SPREAD_PCT}%")
+        return None
+    if sp < 0:
+        print(f"  └ ⚠️ 호가 없음 — 스프레드 필터 미적용")
 
     price_1m_ago    = float(bars[-2]["c"])
     if price_1m_ago <= 0:
@@ -865,7 +1031,7 @@ def check_scheduled_reports():
                 snaps = get_snapshots(held)
                 for sym in held:
                     snap = snaps.get(sym, {})
-                    price, _ = get_live_price(snap)
+                    price, _, _ = get_exit_price(snap)   # [v33] bid 기준
                     if price:
                         sim_close(sym, float(price), "장마감 강제청산", qty=None)
                         print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
@@ -912,6 +1078,11 @@ def run_scan():
         print(f"  {holdings_block().replace(chr(10), ' | ')}")
     if blacklisted_today:
         print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
+
+    # [v33] 개장 직후 블랙아웃 — 신규 진입만 차단
+    if in_open_blackout():
+        print(f"  [⏳ 개장 블랙아웃] 개장 {OPEN_BLACKOUT_MIN}분 경과 전 — 신규매수 스킵")
+        return
 
     # [v31] 일일 리스크 게이트 확인 — 막혀 있으면 신규매수 스킵
     # (보유분 관리는 감시 스레드가 계속 수행하므로 여기서 return해도 안전)
@@ -962,7 +1133,8 @@ def run_scan():
         # 실제로 사지 않은 종목(슬롯 풀/예수금 부족/블랙리스트)이 감시 대상에 남았음.
         # 이제 매수에 성공한 종목만 등록한다.
         with state_lock:
-            bought = sim_open(sym, stock["price"])
+            # [v33] ATR을 넘겨 리스크 사이징에 사용
+            bought = sim_open(sym, stock["price"], stock.get("_atr", 0.0))
             if not bought:
                 continue
 
@@ -989,8 +1161,11 @@ def main():
     global market_close_sent, daily_start_pnl, daily_start_cash
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v32 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v33 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
+    print(f"🩸 [v33] 청산 판단: 호가(bid) 기준 | 스프레드 ≤{MAX_SPREAD_PCT}% | 최소 {MIN_QTY}주")
+    print(f"⚖️  [v33] 사이징: 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}% | ATR×{ATR_LOSS_MULT} 손실가정")
+    print(f"⏳ [v33] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차(절반) | 트레일링(고점 +{TRAIL_ACTIVATE_PCT}% 활성, -{TRAIL_GAP_PCT}%p 갭) | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% (트레일링 미활성 종목만)")
     print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
@@ -1001,12 +1176,15 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v32 시작!</b>\n"
-        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
+        f"🤖 <b>급등 감지 봇 v33 시작!</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ | 스프레드 ≤{MAX_SPREAD_PCT}%\n"
         f"🎯 +{SELL_PARTIAL_PCT}% 1차(절반) → 트레일링(고점 +{TRAIL_ACTIVATE_PCT}%, -{TRAIL_GAP_PCT}%p) | {STOP_LOSS_PCT}% 손절\n"
+        f"🩸 <b>[v33] 청산 판단 = 호가(bid) 기준</b> (IEX 체결 정체 대응)\n"
+        f"⚖️ <b>[v33] ATR 사이징</b> — 1건 리스크 ≤{MAX_RISK_PER_TRADE_PCT}% | 종목당 ≤{MAX_POSITION_PCT}%\n"
+        f"⏳ [v33] 개장 {OPEN_BLACKOUT_MIN}분 신규진입 금지 | 최소 {MIN_QTY}주\n"
         f"📦 동시 보유 최대 {MAX_POSITIONS}종목\n"
-        f"👁 <b>[v32] 보유 감시 {POSITION_CHECK_INTERVAL}초 (스레드 분리)</b> | 스캔 {SCAN_INTERVAL}초\n"
-        f"🩺 손절 슬리피지 추적 기능 추가\n"
+        f"👁 보유 감시 {POSITION_CHECK_INTERVAL}초 (스레드 분리) | 스캔 {SCAN_INTERVAL}초\n"
+        f"🩺 손절 슬리피지 추적\n"
         f"🔒 당일 +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
@@ -1031,6 +1209,10 @@ def main():
                 print(f"[리셋] 장마감 플래그 초기화 | 일일게이트 기준 갱신 "
                       f"(기준자본 ${daily_start_cash:.2f})")
                 slippage_log.clear()   # [v32] 슬리피지 로그도 일단위 리셋
+                # [v33] 기존엔 trade_log를 한 번도 안 지워서 매매일지에
+                # 며칠치 거래가 통째로 누적 출력되고 있었음.
+                trade_log.clear()
+                print("[리셋] 매매일지 초기화 (전일 거래 내역 정리)")
             if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
                 stop_loss_count.clear()
