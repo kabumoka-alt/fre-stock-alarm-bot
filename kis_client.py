@@ -28,10 +28,9 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443" if USE_MOCK \
     else "https://openapi.koreainvestment.com:9443"
 
 # ── tr_id (⚠️ KIS 최신 문서로 재확인 필수) ──
-TR_ID_ORDER_BUY    = "VTTT1002U" if USE_MOCK else "TTTT1002U"  # 해외주식 매수 주문
-TR_ID_ORDER_SELL   = "VTTT1001U" if USE_MOCK else "TTTT1006U"  # 해외주식 매도 주문
-TR_ID_ORDER_CANCEL = "VTTT1004U" if USE_MOCK else "TTTT1004U"  # 해외주식 정정취소
-TR_ID_BALANCE      = "VTTS3012R" if USE_MOCK else "TTTS3012R"  # 해외주식 잔고조회
+TR_ID_ORDER_BUY  = "VTTT1002U" if USE_MOCK else "TTTT1002U"   # 해외주식 매수 주문
+TR_ID_ORDER_SELL = "VTTT1001U" if USE_MOCK else "TTTT1006U"   # 해외주식 매도 주문
+TR_ID_BALANCE    = "VTTS3012R" if USE_MOCK else "TTTS3012R"   # 해외주식 잔고조회
 
 # 미국 주간거래 전용 tr_id (⚠️ 모의투자 지원 여부 및 접두어는 KIS 문서 재확인 필요)
 TR_ID_DAY_BUY  = "TTTS6036U"   # 미국 주간거래 매수
@@ -175,34 +174,6 @@ def place_order(symbol: str, qty: int, price: float, side: str, session: str = "
     return result
 
 
-def cancel_overseas_order(symbol: str, order_no: str, qty: int, exchange: str = "NASD") -> dict:
-    """해외주식 원주문의 미체결 잔량 취소."""
-    body = {
-        "CANO": CANO,
-        "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": exchange,
-        "PDNO": symbol,
-        "ORGN_ODNO": str(order_no),
-        "RVSE_CNCL_DVSN_CD": "02",
-        "ORD_QTY": str(qty),
-        "OVRS_ORD_UNPR": "0",
-        "MGCO_APTM_ODNO": "",
-        "ORD_SVR_DVSN_CD": "0",
-    }
-    result = _request_with_retry(
-        "post",
-        f"{BASE_URL}/uapi/overseas-stock/v1/trading/order-rvsecncl",
-        headers=_headers(TR_ID_ORDER_CANCEL),
-        json=body,
-        timeout=10,
-    )
-    if result.get("rt_cd") != "0":
-        print(f"[KIS 해외주문 취소 오류] {symbol} 주문번호={order_no} qty={qty} → {result}")
-    else:
-        print(f"[KIS 해외주문 취소 성공] {symbol} 주문번호={order_no} qty={qty}")
-    return result
-
-
 def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: str = "BAQ") -> dict:
     """
     미국 주간거래 전용 주문.
@@ -249,15 +220,14 @@ def place_day_order(symbol: str, qty: int, price: float, side: str, exchange: st
 TR_ID_BUYABLE = "VTTS3007R" if USE_MOCK else "TTTS3007R"
 
 
-def get_buyable_amount(symbol: str, price: float, exchange: str = None) -> float:
+def get_buyable_amount(symbol: str, price: float) -> float:
     """
     해외주식 매수가능금액 조회.
     ⚠️ tr_id/응답 필드명은 확인이 완전하지 않으니, 실사용 전 KIS 개발자센터
        문서나 챗봇으로 "해외주식 매수가능금액조회" API를 재확인할 것.
     실패 시 0.0을 반환하여 상위 로직이 안전하게(매수 안 함) 처리하도록 함.
     """
-    if exchange is None:
-        exchange = get_exchange_code(symbol)
+    exchange = get_exchange_code(symbol)
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
@@ -285,73 +255,24 @@ def get_buyable_amount(symbol: str, price: float, exchange: str = None) -> float
         return 0.0
 
 
-def get_overseas_balance(exchange: str = "NASD") -> dict:
+def get_overseas_balance() -> dict:
     """해외주식 잔고 조회."""
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "OVRS_EXCG_CD": exchange,
+        "OVRS_EXCG_CD": "NASD",
         "TR_CRCY_CD": "USD",
         "CTX_AREA_FK200": "",
         "CTX_AREA_NK200": "",
     }
-    return _request_with_retry(
-        "get",
+    _throttle()
+    resp = requests.get(
         f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance",
         headers=_headers(TR_ID_BALANCE),
         params=params,
         timeout=10,
     )
-
-
-def get_overseas_holding(symbol: str, exchange: str = "NASD") -> dict:
-    """
-    해외주식 특정 종목의 실제 잔고 스냅샷.
-    매수 전후 수량 차이로 실제 체결수량을 확인할 때 사용한다.
-    미보유/조회 실패 시 qty=0, avg_price=0.0을 반환한다.
-    """
-    try:
-        bal = get_overseas_balance(exchange)
-    except Exception as e:
-        print(f"[KIS 해외 보유수량 조회 예외] {symbol} {e}")
-        return {"ok": False, "qty": 0, "sellable_qty": 0,
-                "avg_price": 0.0, "purchase_amount": 0.0}
-    if bal.get("rt_cd") != "0":
-        print(f"[KIS 해외 보유수량 조회 오류] {symbol} {bal}")
-        return {"ok": False, "qty": 0, "sellable_qty": 0,
-                "avg_price": 0.0, "purchase_amount": 0.0}
-
-    for h in bal.get("output1", []):
-        if h.get("ovrs_pdno") != symbol:
-            continue
-        try:
-            qty = int(float(h.get("ovrs_cblc_qty") or 0))
-        except (TypeError, ValueError):
-            qty = 0
-        try:
-            sellable_qty = int(float(h.get("ord_psbl_qty") or qty))
-        except (TypeError, ValueError):
-            sellable_qty = qty
-        try:
-            avg_price = float(h.get("pchs_avg_pric") or 0)
-        except (TypeError, ValueError):
-            avg_price = 0.0
-        try:
-            purchase_amount = float(h.get("frcr_pchs_amt1") or 0)
-        except (TypeError, ValueError):
-            purchase_amount = 0.0
-        if purchase_amount <= 0 and qty > 0:
-            purchase_amount = qty * avg_price
-        return {
-            "ok": True,
-            "qty": qty,
-            "sellable_qty": sellable_qty,
-            "avg_price": avg_price,
-            "purchase_amount": purchase_amount,
-        }
-
-    return {"ok": True, "qty": 0, "sellable_qty": 0,
-            "avg_price": 0.0, "purchase_amount": 0.0}
+    return resp.json()
 
 
 # ══════════════════════════════════════════
@@ -694,3 +615,5 @@ if __name__ == "__main__":
 
     print("\n── 국내주식 등락률 순위 (상위 5) ──")
     print(json.dumps(get_domestic_ranking(top=5), indent=2, ensure_ascii=False))
+
+
