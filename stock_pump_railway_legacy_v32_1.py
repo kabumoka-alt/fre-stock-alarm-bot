@@ -1,0 +1,1321 @@
+"""
+미국 주식 급등 감지 봇 v32.1 (정규장 전용 + 시뮬레이션 + 매매일지)
+- 정규장(09:30~16:00 ET)만 스캔
+- 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
+- OBV 방향 참고 표시 (필터 아님)
+- 매도 타이밍: +7% 1차(절반) → 나머지는 트레일링 스톱으로 관리, -8% 손절
+- [v16] 텔레그램 알림 최소화: 매시 정각 중간 일지 / 장마감 최종 일지만 수신
+- [v17] ATR 기반 변동성 정렬: 상위 30종목 중 ATR 높은 순으로 재정렬 후 진입
+- [v18] 횡보 청산: 매수 후 10분 경과 & +3~+6% 구간 시 전량 청산
+- [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
+- [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
+- [v25] 저가주 필터: $1 미만 종목 진입 제외
+- [v30] 예수금 배분 방식 변경: 30% 고정 → 남은 슬롯 균등 분배 (예수금 ÷ 남은 슬롯)
+- [v31] 손절 폭 조정 -10% → -8%, 폴링 60→30초 (슬리피지 축소)
+- [v31] 동시 보유 7 → 4 종목 (자본 집중)
+- [v31] 트레일링 스톱 도입: 고점 +TRAIL_ACTIVATE_PCT 이상에서 활성화,
+        고점 대비 -TRAIL_GAP_PCT%p 하락 시 청산 (기존 +15% 전량 대체 → 승자 태우기)
+- [v31] 횡보청산 완화: 트레일링 활성(고점≥활성임계) 종목은 횡보청산 면제
+- [v31] 일일 리스크 게이트: 당일 실현손익 +5% 도달 시 신규매수 중단(수익잠금),
+        -4% 도달 시 신규매수 중단(손실한도). 보유분 청산 로직은 계속 동작.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[v32] 손절 슬리피지 근본 원인 제거 — 4개 수정
+  1) 보유 종목 감시를 별도 스레드로 분리 (3초 주기).
+     기존: 손절 체크가 run_scan() 맨 앞 1회 → 스캔(최대 63 API콜, 15~30초)
+           + sleep 30초 = 실효 감시 간격 45~90초.
+           그래서 -8% 손절이 -18%, -21%에 체결됨.
+     변경: 감시 스레드는 보유 종목만 API 1콜로 3초마다 체크. 스캔과 무관.
+  2) sim_close 시 entry_prices 정리 (기존엔 영구 잔류 → 스캔 누적 지연 유발)
+  3) 유령 진입 제거: 매수 성공한 종목만 entry_prices 등록
+     (기존엔 매수 실패/스킵해도 등록되어 감시 대상에 포함)
+  4) 중복 get_bars 제거: ATR 재정렬에서 받은 bars를 analyze_regular에 재사용
+     (스캔당 최대 30콜 절감 → 스캔 소요시간 약 절반)
+
+  ※ 이번 버전에서 의도적으로 "안 바꾼" 것들 (효과 측정을 위해 분리):
+     - 1주 절반익절 버그 (max(1, qty//2) → 1주면 전량청산)
+     - 스프레드/유동성 필터
+     - ATR 기반 사이징
+     - 서머타임 처리 (get_et_now UTC-4 하드코딩, 11월에 깨짐)
+     → 위 4개 효과를 하루 확인한 뒤 v33에서 적용할 것.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import os
+import time
+import threading
+import requests
+import json
+import shutil
+import atexit
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+
+
+# ──────────────────────────────────────────
+# 독립 실행용 봇 식별 정보
+# ──────────────────────────────────────────
+BOT_TITLE    = "레일웨이 구버전"
+BOT_FILENAME = "stock_pump_railway_legacy_v32_1.py"
+BOT_VERSION  = "v32.1"
+
+TELEGRAM_HEADER = (
+    f"🤖 <b>{BOT_TITLE}</b>\n"
+    f"📄 <code>{BOT_FILENAME}</code>\n"
+    f"🚀 Version <b>{BOT_VERSION}</b>\n\n"
+)
+
+
+# ──────────────────────────────────────────
+# [v32.1] 독립 상태 저장
+# ──────────────────────────────────────────
+STATE_DIR = Path.home() / ".stock_pump_railway_legacy"
+STATE_FILE = STATE_DIR / "legacy_state.json"
+STATE_BACKUP_FILE = STATE_DIR / "legacy_state_backup.json"
+STATE_SAVE_INTERVAL = 30
+last_state_save_ts = 0.0
+
+# 정규장 조건
+REGULAR_TOP_N        = 30
+REGULAR_RSI          = 50
+PRICE_CHANGE_1M      = 3.0
+VOLUME_SURGE_RATIO   = 1.5   # 최근 봉 평균 대비 현재 거래량 배율 기준
+MIN_PRICE            = 1.0   # [v25] 저가주 필터: $1 미만 종목 진입 제외
+
+# [v32] 스캔 주기와 보유 종목 감시 주기를 분리
+SCAN_INTERVAL           = 30  # 신규 종목 스캔 주기(초) — 기존 CHECK_INTERVAL
+POSITION_CHECK_INTERVAL = 3   # 보유 종목 감시 주기(초) — 손절/트레일링 반응 속도
+
+COOLDOWN_MINUTES      = 30
+SELL_COOLDOWN_MINUTES = 60
+MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
+MAX_POSITIONS         = 4    # [v31] 7 → 4 (자본 집중)
+
+# 매도 타이밍 임계값
+SELL_PARTIAL_PCT = 7.0
+STOP_LOSS_PCT    = -8.0      # [v31] -10 → -8
+
+# [v31] 트레일링 스톱
+TRAIL_ACTIVATE_PCT = 6.0     # 고점이 +6% 이상 찍히면 트레일링 활성화
+TRAIL_GAP_PCT      = 4.0     # 고점 대비 -4%p 하락 시 청산 (마이크로캡 변동성 감안 넓게)
+
+# [v18] 횡보 청산 조건
+SIDEWAYS_MINUTES = 10
+SIDEWAYS_MIN_PCT = 3.0     # [v20] 횡보 구간 하한
+SIDEWAYS_MAX_PCT = 6.0     # [v31] 상한을 트레일링 활성임계(6%)와 일치시켜 구간 겹침 제거
+
+# [v31] 일일 리스크 게이트
+DAILY_PROFIT_LOCK_PCT = 5.0   # 당일 실현손익 +5% 도달 시 신규매수 중단 (수익잠금)
+DAILY_LOSS_LIMIT_PCT  = -4.0  # 당일 실현손익 -4% 도달 시 신규매수 중단 (손실한도)
+
+HEADERS = {
+    "APCA-API-KEY-ID":     ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+}
+
+entry_prices = {}
+last_alert   = {}
+
+# [v32] 감시 스레드와 메인 스캔 스레드가 공유 상태를 동시에 건드리지 않도록 보호.
+# RLock인 이유: sim_close 내부에서 다시 락을 잡는 경로가 생겨도 데드락이 나지 않게.
+state_lock = threading.RLock()
+
+# ──────────────────────────────────────────
+# 시뮬레이션 상태
+# ──────────────────────────────────────────
+SIM_INITIAL_CASH = 100.0
+# [v30] 예수금 배분: 남은 슬롯(MAX_POSITIONS - 현재보유) 균등 분배 방식으로 전환
+
+sim_positions: dict = {}
+# { sym: {"entry": float, "qty": int, "partial_done": bool} }
+
+sim_stats = {
+    "initial_cash": SIM_INITIAL_CASH,
+    "cash":         SIM_INITIAL_CASH,
+    "total_pnl":    0.0,
+    "trades":       0,
+    "wins":         0,
+    "losses":       0,
+}
+
+# [v31] 일일 리스크 게이트 기준값 (장 시작 시 갱신)
+daily_start_pnl:  float = 0.0
+daily_start_cash: float = SIM_INITIAL_CASH
+
+# [v23] 종목당 손절 횟수 제한으로 전환
+# stop_loss_count[sym] = 당일 손절 횟수, MAX_STOP_LOSS_COUNT 도달 시 당일 블랙리스트
+stop_loss_count: dict = {}
+MAX_STOP_LOSS_COUNT = 2   # 2회까지는 재진입 허용, 3회째 손절부터 당일 차단
+
+# 손절 횟수가 MAX_STOP_LOSS_COUNT 이상 도달한 종목 (실질 블랙리스트)
+blacklisted_today: set = set()
+
+# 오늘 거래 일지: [{"sym", "action", "qty", "price", "pnl", "pnl_pct", "time_kst"}]
+trade_log: list = []
+
+# 매시 정각 / 장마감 전송 추적
+last_hourly_report_et: int = -1
+market_close_sent: bool    = False
+
+# [v32] 슬리피지 진단용 — 손절 트리거 시 실제 체결 괴리 기록
+slippage_log: list = []
+
+
+
+# ──────────────────────────────────────────
+# [v32.1] 상태 저장 / 복원
+# ──────────────────────────────────────────
+
+def _dt_to_iso(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _iso_to_dt(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _serialize_entry_prices():
+    result = {}
+    for sym, entry in entry_prices.items():
+        item = dict(entry)
+        for key in ("time", "alert1", "stop"):
+            item[key] = _dt_to_iso(item.get(key))
+        result[sym] = item
+    return result
+
+
+def _deserialize_entry_prices(raw):
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for sym, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        item["time"] = _iso_to_dt(item.get("time")) or datetime.now(timezone.utc)
+        item["alert1"] = _iso_to_dt(item.get("alert1"))
+        item["stop"] = _iso_to_dt(item.get("stop"))
+        item.setdefault("sideways_done", False)
+        item.setdefault("peak", 0.0)
+        result[sym] = item
+    return result
+
+
+def _build_state_payload():
+    return {
+        "schema_version": 1,
+        "bot_title": BOT_TITLE,
+        "bot_version": BOT_VERSION,
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "sim_stats": dict(sim_stats),
+        "sim_positions": {sym: dict(pos) for sym, pos in sim_positions.items()},
+        "entry_prices": _serialize_entry_prices(),
+        "last_alert": {sym: _dt_to_iso(value) for sym, value in last_alert.items()},
+        "stop_loss_count": dict(stop_loss_count),
+        "blacklisted_today": sorted(blacklisted_today),
+        "trade_log": list(trade_log),
+        "slippage_log": list(slippage_log),
+        "daily_start_pnl": daily_start_pnl,
+        "daily_start_cash": daily_start_cash,
+        "last_hourly_report_et": last_hourly_report_et,
+        "market_close_sent": market_close_sent,
+    }
+
+
+def save_state(force=False):
+    """상태를 임시파일에 쓴 뒤 원자적으로 교체하고, 직전 정상본은 백업한다."""
+    global last_state_save_ts
+    now = time.time()
+    if not force and (now - last_state_save_ts) < STATE_SAVE_INTERVAL:
+        return
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_file = STATE_FILE.with_suffix(".tmp")
+
+        with state_lock:
+            payload = _build_state_payload()
+
+        with tmp_file.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if STATE_FILE.exists():
+            shutil.copy2(STATE_FILE, STATE_BACKUP_FILE)
+
+        os.replace(tmp_file, STATE_FILE)
+        last_state_save_ts = now
+    except Exception as e:
+        print(f"[상태 저장 경고] {e}")
+
+
+def _apply_state_payload(data):
+    global daily_start_pnl, daily_start_cash
+    global last_hourly_report_et, market_close_sent
+
+    if not isinstance(data, dict):
+        raise ValueError("상태파일 형식이 올바르지 않습니다.")
+
+    loaded_stats = data.get("sim_stats", {})
+    if isinstance(loaded_stats, dict):
+        for key in sim_stats:
+            if key in loaded_stats:
+                sim_stats[key] = loaded_stats[key]
+
+    sim_positions.clear()
+    raw_positions = data.get("sim_positions", {})
+    if isinstance(raw_positions, dict):
+        for sym, pos in raw_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            try:
+                sim_positions[sym] = {
+                    "entry": float(pos["entry"]),
+                    "qty": int(pos["qty"]),
+                    "partial_done": bool(pos.get("partial_done", False)),
+                }
+            except Exception:
+                continue
+
+    entry_prices.clear()
+    entry_prices.update(_deserialize_entry_prices(data.get("entry_prices", {})))
+
+    # 구버전 상태에서 entry_prices가 누락된 경우 보유종목 기준으로 최소 복원
+    for sym, pos in sim_positions.items():
+        entry_prices.setdefault(sym, {
+            "entry": pos["entry"],
+            "time": datetime.now(timezone.utc),
+            "alert1": None,
+            "stop": None,
+            "sideways_done": False,
+            "peak": 0.0,
+        })
+
+    last_alert.clear()
+    raw_alerts = data.get("last_alert", {})
+    if isinstance(raw_alerts, dict):
+        for sym, value in raw_alerts.items():
+            dt = _iso_to_dt(value)
+            if dt:
+                last_alert[sym] = dt
+
+    stop_loss_count.clear()
+    raw_counts = data.get("stop_loss_count", {})
+    if isinstance(raw_counts, dict):
+        for sym, value in raw_counts.items():
+            try:
+                stop_loss_count[sym] = int(value)
+            except Exception:
+                pass
+
+    blacklisted_today.clear()
+    raw_blacklist = data.get("blacklisted_today", [])
+    if isinstance(raw_blacklist, list):
+        blacklisted_today.update(str(sym) for sym in raw_blacklist)
+
+    trade_log.clear()
+    raw_trade_log = data.get("trade_log", [])
+    if isinstance(raw_trade_log, list):
+        trade_log.extend(raw_trade_log[-5000:])
+
+    slippage_log.clear()
+    raw_slippage = data.get("slippage_log", [])
+    if isinstance(raw_slippage, list):
+        slippage_log.extend(raw_slippage[-1000:])
+
+    daily_start_pnl = float(data.get("daily_start_pnl", sim_stats["total_pnl"]))
+    daily_start_cash = float(data.get("daily_start_cash", sim_stats["cash"]))
+    last_hourly_report_et = int(data.get("last_hourly_report_et", -1))
+    market_close_sent = bool(data.get("market_close_sent", False))
+
+
+def load_state():
+    """기본 상태파일을 읽고, 손상 시 백업파일로 자동 복구한다."""
+    for candidate, label in (
+        (STATE_FILE, "기본 상태파일"),
+        (STATE_BACKUP_FILE, "백업 상태파일"),
+    ):
+        if not candidate.exists():
+            continue
+        try:
+            with candidate.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            with state_lock:
+                _apply_state_payload(data)
+
+            print(
+                f"[상태 복원 완료] {label} | 예수금 ${sim_stats['cash']:.2f} | "
+                f"누적손익 {sim_stats['total_pnl']:+.2f}$ | 보유 {len(sim_positions)}종목"
+            )
+
+            # 백업으로 복원한 경우 기본 파일을 즉시 재생성
+            if candidate == STATE_BACKUP_FILE:
+                save_state(force=True)
+
+            return True, label
+        except Exception as e:
+            print(f"[상태 복원 실패] {label}: {e}")
+
+    print("[상태 복원] 저장된 상태 없음 — $100 신규 시작")
+    return False, "신규 시작"
+
+
+def restored_state_message(source_label):
+    total_return_pct = (
+        sim_stats["total_pnl"] / sim_stats["initial_cash"] * 100
+        if sim_stats["initial_cash"] else 0.0
+    )
+    return (
+        f"💾 <b>상태 복원 완료</b> ({source_label})\\n"
+        f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\\n"
+        f"💰 누적 손익: <b>{sim_stats['total_pnl']:+.2f}$ "
+        f"({total_return_pct:+.2f}%)</b>\\n"
+        f"📦 보유 종목: <b>{len(sim_positions)}개</b>\\n"
+        f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 | "
+        f"총 {sim_stats['trades']}거래"
+    )
+
+
+# ──────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────
+
+def naver_link(sym: str) -> str:
+    return f'<a href="https://m.stock.naver.com/worldstock/stock/{sym}/total">{sym}</a>'
+
+
+def _send_telegram_chunk(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json={
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       text,
+            "parse_mode": "HTML",
+        }, timeout=5)
+        if resp.status_code != 200:
+            print(f"[텔레그램 오류] {resp.text}")
+    except Exception as e:
+        print(f"[텔레그램 예외] {e}")
+
+
+def send_telegram(message: str):
+    """텔레그램 전송. 모든 메시지에 봇 식별 헤더를 붙이고, 길면 분할 전송."""
+    if not message.startswith(TELEGRAM_HEADER):
+        message = TELEGRAM_HEADER + message
+
+    TELEGRAM_MAX = 4000   # 안전 여유 (실제 한도 4096)
+    if len(message) <= TELEGRAM_MAX:
+        _send_telegram_chunk(message)
+        return
+
+    # 줄 단위로 잘라서 청크 구성
+    lines = message.split("\n")
+    chunk = ""
+    for line in lines:
+        # 한 줄 자체가 너무 길면 강제로 잘라 전송
+        if len(line) > TELEGRAM_MAX:
+            if chunk:
+                _send_telegram_chunk(chunk)
+                chunk = ""
+            for i in range(0, len(line), TELEGRAM_MAX):
+                _send_telegram_chunk(line[i:i + TELEGRAM_MAX])
+            continue
+        # 현재 청크에 이 줄을 더하면 한도 초과 → 지금까지 청크 전송 후 새로 시작
+        if len(chunk) + len(line) + 1 > TELEGRAM_MAX:
+            _send_telegram_chunk(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        _send_telegram_chunk(chunk)
+
+
+def get_et_now():
+    return datetime.now(timezone.utc) + timedelta(hours=-4)
+
+
+def is_regular_session() -> bool:
+    now_et = get_et_now()
+    et_min = now_et.hour * 60 + now_et.minute
+    if now_et.weekday() >= 5:
+        return False
+    return (9 * 60 + 30) <= et_min <= (16 * 60)
+
+
+# ──────────────────────────────────────────
+# [v31] 일일 리스크 게이트
+# ──────────────────────────────────────────
+
+def daily_pnl_pct() -> float:
+    """당일 실현손익률(%) — 장 시작 자본 대비."""
+    if daily_start_cash <= 0:
+        return 0.0
+    return (sim_stats["total_pnl"] - daily_start_pnl) / daily_start_cash * 100
+
+
+def buys_allowed() -> tuple[bool, str]:
+    """신규매수 허용 여부 + 사유. 보유분 청산은 이 게이트와 무관하게 항상 동작."""
+    d = daily_pnl_pct()
+    if d >= DAILY_PROFIT_LOCK_PCT:
+        return False, f"수익잠금(당일 {d:+.1f}%)"
+    if d <= DAILY_LOSS_LIMIT_PCT:
+        return False, f"손실한도(당일 {d:+.1f}%)"
+    return True, ""
+
+
+# ──────────────────────────────────────────
+# 보유 종목 현황 블록
+# ──────────────────────────────────────────
+
+def holdings_block(current_prices: dict = None) -> str:
+    """
+    current_prices: {sym: float} — 매매일지 생성 시 API 조회한 현재가.
+    None이면 진입가만 표시 (기존 동작 유지).
+    """
+    if not sim_positions:
+        return "📭 <b>보유 종목:</b> 없음"
+    lines = ["📦 <b>보유 종목:</b>"]
+    for sym, pos in sim_positions.items():
+        status = "1차완료" if pos["partial_done"] else "전량보유"
+        if current_prices and sym in current_prices:
+            cur   = current_prices[sym]
+            pnl_pct = ((cur - pos["entry"]) / pos["entry"]) * 100
+            pnl_amt = (cur - pos["entry"]) * pos["qty"]
+            icon  = "📈" if pnl_pct >= 0 else "📉"
+            lines.append(
+                f"  • {naver_link(sym)} {pos['qty']}주 @ ${pos['entry']:.2f} [{status}]\n"
+                f"    {icon} 현재 ${cur:.2f} ({pnl_pct:+.2f}%, {pnl_amt:+.2f}$)"
+            )
+        else:
+            lines.append(
+                f"  • {naver_link(sym)} {pos['qty']}주 @ ${pos['entry']:.2f} [{status}]"
+            )
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────
+# 블랙리스트 현황 블록
+# ──────────────────────────────────────────
+
+def blacklist_block() -> str:
+    if not blacklisted_today:
+        return ""
+    syms = ", ".join(
+        f"{sym}({stop_loss_count.get(sym, 0)}회)" for sym in sorted(blacklisted_today)
+    )
+    return f"🚫 <b>당일 블랙리스트:</b> {syms}"
+
+
+# ──────────────────────────────────────────
+# [v32] 슬리피지 진단 블록
+# ──────────────────────────────────────────
+
+def slippage_block() -> str:
+    """
+    손절 실제 체결이 STOP_LOSS_PCT에서 얼마나 벗어났는지 요약.
+    감시 스레드 분리 효과를 하루 단위로 검증하기 위한 지표.
+    """
+    if not slippage_log:
+        return ""
+    excesses = [s["excess"] for s in slippage_log]
+    worst    = max(slippage_log, key=lambda s: s["excess"])
+    avg      = sum(excesses) / len(excesses)
+    return (
+        f"🩺 <b>손절 슬리피지:</b> {len(slippage_log)}건 | "
+        f"평균 초과 {avg:.2f}%p | 최악 {worst['sym']} {worst['excess']:.2f}%p"
+    )
+
+
+# ──────────────────────────────────────────
+# 매매일지 빌더
+# ──────────────────────────────────────────
+
+def build_trade_report(title: str) -> str:
+    now_kst          = datetime.now(timezone.utc) + timedelta(hours=9)
+    total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
+    win_rate         = (
+        sim_stats["wins"] / sim_stats["trades"] * 100
+        if sim_stats["trades"] > 0 else 0.0
+    )
+
+    # [v19] 보유 종목 현재가 조회
+    current_prices = {}
+    if sim_positions:
+        snaps = get_snapshots(list(sim_positions.keys()))
+        for sym, snap in snaps.items():
+            price, _ = get_live_price(snap)
+            if price:
+                current_prices[sym] = float(price)
+
+    lines = [
+        f"📋 <b>{title}</b>",
+        f"🇰🇷 {now_kst.strftime('%m/%d %H:%M')} KST",
+        f"━━━━━━━━━━━━━━",
+    ]
+
+    if trade_log:
+        lines.append("📝 <b>거래 내역:</b>")
+        for t in trade_log:
+            icon = "📥" if t["action"] == "BUY" else ("📈" if t["pnl"] >= 0 else "📉")
+            if t["action"] == "BUY":
+                lines.append(
+                    f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 매수 @ ${t['price']:.2f}"
+                )
+            else:
+                lines.append(
+                    f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 {t['reason']} "
+                    f"@ ${t['price']:.2f} ({t['pnl']:+.2f}$, {t['pnl_pct']:+.2f}%)"
+                )
+    else:
+        lines.append("📝 거래 내역: 없음")
+
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append(holdings_block(current_prices))
+
+    bl = blacklist_block()
+    if bl:
+        lines.append(bl)
+
+    # [v32] 슬리피지 진단
+    sl = slippage_block()
+    if sl:
+        lines.append(sl)
+
+    # [v31] 일일 게이트 상태 표시
+    ok, reason = buys_allowed()
+    if not ok:
+        lines.append(f"🔒 <b>신규매수 중단:</b> {reason}")
+
+    lines.append("━━━━━━━━━━━━━━")
+
+    pnl_sign = "+" if sim_stats["total_pnl"] >= 0 else ""
+    lines += [
+        f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>",
+        f"💰 누적 손익: <b>{pnl_sign}{sim_stats['total_pnl']:.2f}$</b> "
+        f"(<b>{total_return_pct:+.2f}%</b>)",
+        f"📅 당일 실현손익: <b>{daily_pnl_pct():+.2f}%</b>",
+        f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
+        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래",
+    ]
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────
+# 시뮬레이션 헬퍼
+# ──────────────────────────────────────────
+
+def sim_open(sym: str, price: float) -> bool:
+    """매수 신호 → 남은 슬롯 균등 분배 방식으로 매수 (예수금 ÷ 남은 슬롯)."""
+    if sym in sim_positions:
+        return False
+    if sym in blacklisted_today:
+        print(f"  [시뮬 매수 차단] {sym} — 당일 블랙리스트")
+        return False
+    # [v29] 동시 보유 종목 수 제한
+    if len(sim_positions) >= MAX_POSITIONS:
+        print(f"  [시뮬 매수 불가] {sym} — 보유 종목 {len(sim_positions)}개 (최대 {MAX_POSITIONS}개)")
+        return False
+    # [v30] 남은 슬롯에 예수금 균등 분배
+    remaining_slots = MAX_POSITIONS - len(sim_positions)
+    budget          = sim_stats["cash"] / remaining_slots
+    qty             = int(budget // price)
+    if qty < 1:
+        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={price:.2f})")
+        return False
+    cost = price * qty
+    sim_stats["cash"] -= cost
+    sim_positions[sym] = {"entry": price, "qty": qty, "partial_done": False}
+    now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    trade_log.append({
+        "action": "BUY", "sym": sym, "qty": qty, "price": price,
+        "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
+        "time_kst": now_kst.strftime("%H:%M"),
+    })
+    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (슬롯예산={cost:.2f}, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
+    save_state(force=True)
+    return True
+
+
+def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
+    """
+    포지션 청산.
+    qty=None 이면 전량 청산.
+    손절 시 블랙리스트 카운트 등록.
+    반환값: 텔레그램 시뮬 요약 문자열.
+    """
+    pos = sim_positions.get(sym)
+    if not pos:
+        return ""
+
+    entry_price = pos["entry"]   # 청산 전에 미리 저장
+    close_qty   = qty if qty is not None else pos["qty"]
+    pnl         = (exit_price - entry_price) * close_qty
+    pnl_pct     = ((exit_price - entry_price) / entry_price) * 100
+
+    sim_stats["cash"] += exit_price * close_qty
+    pos["qty"] -= close_qty
+
+    if pos["qty"] <= 0:
+        del sim_positions[sym]
+        # [v32] 포지션이 완전히 닫혔으면 entry_prices도 같이 제거.
+        # 기존엔 남아 있어서 (a) 청산된 종목이 매 스캔마다 API 조회 대상이 되고
+        # (b) check_sell_timing이 옛 진입가로 계속 돌아 스캔이 날이 갈수록 느려짐 → 슬리피지 악화.
+        entry_prices.pop(sym, None)
+        sim_stats["total_pnl"] += pnl
+        sim_stats["trades"]    += 1
+        if pnl >= 0:
+            sim_stats["wins"]   += 1
+        else:
+            sim_stats["losses"] += 1
+    else:
+        pos["partial_done"]     = True
+        sim_stats["total_pnl"] += pnl
+
+    # [v23] 손절 시 카운트 증가, 허용 횟수(MAX_STOP_LOSS_COUNT) 도달 시에만 블랙리스트 등록
+    if "손절" in reason:
+        stop_loss_count[sym] = stop_loss_count.get(sym, 0) + 1
+        cnt = stop_loss_count[sym]
+        if cnt > MAX_STOP_LOSS_COUNT:
+            blacklisted_today.add(sym)
+            print(f"  [블랙리스트 등록] {sym} — 손절 {cnt}회 누적, 당일 재진입 금지")
+        else:
+            remaining = MAX_STOP_LOSS_COUNT - cnt
+            print(f"  [손절 카운트] {sym} — {cnt}회째 (재진입 {remaining}회 더 허용)")
+
+        # [v32] 슬리피지 기록: 의도한 -8%와 실제 체결률의 괴리
+        excess = abs(pnl_pct) - abs(STOP_LOSS_PCT)
+        if excess > 0:
+            slippage_log.append({"sym": sym, "actual": pnl_pct, "excess": excess})
+            mark = "🚨" if excess >= 3.0 else "⚠️"
+            print(f"  {mark} [슬리피지] {sym} 의도 {STOP_LOSS_PCT:.1f}% → 실제 {pnl_pct:+.2f}% "
+                  f"(초과 {excess:.2f}%p)")
+
+    now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    trade_log.append({
+        "action": "SELL", "sym": sym, "qty": close_qty, "price": exit_price,
+        "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+        "time_kst": now_kst.strftime("%H:%M"),
+    })
+
+    win_rate         = (
+        sim_stats["wins"] / sim_stats["trades"] * 100
+        if sim_stats["trades"] > 0 else 0.0
+    )
+    total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
+
+    bl_note = f"\n🚫 {sym} 당일 블랙리스트 등록" if "손절" in reason else ""
+
+    summary = (
+        f"\n\n💹 <b>[시뮬레이션]</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📤 청산: {reason} | {close_qty}주 @ ${exit_price:.2f}\n"
+        f"📥 진입가: ${entry_price:.2f}\n"
+        f"{'📈' if pnl >= 0 else '📉'} 건별 손익: "
+        f"<b>{'+' if pnl >= 0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
+        f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
+        f"💰 누적 손익: <b>{'+' if sim_stats['total_pnl'] >= 0 else ''}"
+        f"{sim_stats['total_pnl']:.2f}$</b> (<b>{total_return_pct:+.2f}%</b>)\n"
+        f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
+        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래\n"
+        f"{holdings_block()}"
+        f"{bl_note}"
+    )
+    save_state(force=True)
+    return summary
+
+
+# ──────────────────────────────────────────
+# Alpaca API
+# ──────────────────────────────────────────
+
+def is_warrant(sym: str) -> bool:
+    """
+    [v27] 워런트/유닛 등 파생 티커 판별.
+    - '.WS' 접미사 (예: TE.WS)
+    - 'W'로 끝나는 5글자 이상 티커 (예: EVLVW, AUROW, AFRIW)
+    - '.U', '.UN' 유닛, '.R' 라이트 등
+    """
+    s = sym.upper()
+    if any(suffix in s for suffix in (".WS", ".WT", ".U", ".UN", ".RT", ".R")):
+        return True
+    # W로 끝나는 5글자 이상 티커는 워런트일 가능성 높음
+    if len(s) >= 5 and s.endswith("W") and "." not in s:
+        return True
+    return False
+
+
+def get_active_symbols():
+    # [v21] most-actives(거래횟수) → movers(상승률 기준)으로 변경
+    url    = "https://data.alpaca.markets/v1beta1/screener/stocks/movers"
+    params = {"top": 50}
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code == 200:
+            data    = resp.json()
+            gainers = data.get("gainers", [])
+            # [v27] 워런트/유닛 제외
+            symbols  = [d["symbol"] for d in gainers if not is_warrant(d["symbol"])]
+            excluded = [d["symbol"] for d in gainers if is_warrant(d["symbol"])]
+            if excluded:
+                print(f"  [워런트 제외] {excluded}")
+            return symbols
+        print(f"[스크리너 오류] {resp.status_code}")
+        return []
+    except Exception as e:
+        print(f"[스크리너 예외] {e}")
+        return []
+
+
+def get_snapshots(symbols: list):
+    url    = "https://data.alpaca.markets/v2/stocks/snapshots"
+    params = {"symbols": ",".join(symbols)}
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"[스냅샷 오류] {resp.status_code}")
+        return {}
+    except Exception as e:
+        print(f"[스냅샷 예외] {e}")
+        return {}
+
+
+def get_bars(symbol: str, limit: int = 30):
+    url    = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    params = {"timeframe": "1Min", "limit": limit, "sort": "asc"}
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code == 200:
+            bars = resp.json().get("bars", [])
+            if bars:
+                return bars
+        params["feed"] = "iex"
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("bars", [])
+        return []
+    except:
+        return []
+
+
+# ──────────────────────────────────────────
+# 지표 계산
+# ──────────────────────────────────────────
+
+def calc_rsi(bars: list, period: int = 14):
+    if len(bars) < period + 1:
+        return None
+    closes = [float(b["c"]) for b in bars]
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+def calc_obv(bars: list) -> str:
+    if len(bars) < 3:
+        return "-"
+    obv, obv_list = 0, []
+    for i, bar in enumerate(bars):
+        if i == 0:
+            obv_list.append(obv)
+            continue
+        close      = float(bar["c"])
+        prev_close = float(bars[i - 1]["c"])
+        vol        = float(bar["v"])
+        if close > prev_close:
+            obv += vol
+        elif close < prev_close:
+            obv -= vol
+        obv_list.append(obv)
+    recent  = obv_list[-5:]
+    rising  = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
+    falling = len(recent) - 1 - rising
+    if rising  >= 3:
+        return "📈상승"
+    elif falling >= 3:
+        return "📉하락"
+    else:
+        return "➡️횡보"
+
+
+def calc_volume_surge(bars: list) -> tuple[float, bool]:
+    """
+    거래량 급등 체크 — 최근 5봉 합산 vs 그 이전 봉 평균×5 비교 (참고용 표시).
+    봉 수가 적으면 가용 데이터로 계산. 반환: (배율, 조건충족여부)
+    """
+    if len(bars) < 6:
+        return 0.0, False
+    recent_5   = bars[-5:]           # 최근 5봉
+    history    = bars[:-5]           # 그 이전 전체 (최대 20봉으로 제한)
+    history    = history[-20:]
+    if not history:
+        return 0.0, False
+    avg_vol_per_bar = sum(float(b["v"]) for b in history) / len(history)
+    if avg_vol_per_bar <= 0:
+        return 0.0, False
+    recent_vol  = sum(float(b["v"]) for b in recent_5)
+    baseline    = avg_vol_per_bar * 5   # 이전 평균을 5봉 기준으로 환산
+    ratio       = recent_vol / baseline
+    return ratio, ratio >= VOLUME_SURGE_RATIO
+
+
+def calc_atr(bars: list, period: int = 14) -> float:
+    """
+    [v17] ATR (Average True Range) 계산.
+    True Range = max(고-저, |고-전일종가|, |저-전일종가|)
+    반환: ATR 값 (데이터 부족 시 0.0)
+    """
+    if len(bars) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(bars)):
+        high      = float(bars[i]["h"])
+        low       = float(bars[i]["l"])
+        prev_close = float(bars[i - 1]["c"])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if len(trs) < period:
+        return 0.0
+    return sum(trs[-period:]) / period
+
+
+def get_live_price(snap: dict):
+    lt     = snap.get("latestTrade", {})
+    mb     = snap.get("minuteBar",   {})
+    db     = snap.get("dailyBar",    {})
+    price  = lt.get("p") or mb.get("c") or db.get("c")
+    source = "호가" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
+    return price, source
+
+
+def build_ranked(snapshots: dict):
+    ranked = []
+    for sym, snap in snapshots.items():
+        prev = snap.get("prevDailyBar", {})
+        if not prev or not prev.get("c"):
+            continue
+        current_price, price_source = get_live_price(snap)
+        if not current_price:
+            continue
+        prev_close = prev["c"]
+        change_pct = ((current_price - prev_close) / prev_close) * 100
+        ranked.append({
+            "symbol":       sym,
+            "price":        current_price,
+            "price_source": price_source,
+            "prev_close":   prev_close,
+            "change_pct":   change_pct,
+            "snap":         snap,
+        })
+    return sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
+
+
+# ──────────────────────────────────────────
+# 매도 타이밍 체크
+# ──────────────────────────────────────────
+
+def check_sell_timing(sym: str, current_price: float, price_source: str):
+    if sym not in entry_prices:
+        return
+    entry       = entry_prices[sym]
+    entry_price = entry["entry"]
+    now_utc     = datetime.now(timezone.utc)
+    gain_pct    = ((current_price - entry_price) / entry_price) * 100
+    ticker_link = naver_link(sym)
+
+    # [v31] 고점(peak) 갱신 — 트레일링 스톱 기준
+    if gain_pct > entry.get("peak", 0.0):
+        entry["peak"] = gain_pct
+    peak = entry.get("peak", 0.0)
+
+    def cooldown_ok(key):
+        last = entry.get(key)
+        if last is None:
+            return True
+        return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
+
+    # ── 손절 (-8%) ──
+    if gain_pct <= STOP_LOSS_PCT:
+        if cooldown_ok("stop"):
+            entry["stop"] = now_utc
+            if sym in sim_positions:
+                sim_close(sym, current_price, "손절(-8%)", qty=None)
+            print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+        return
+
+    # ── [v31] 트레일링 스톱 (고점 +6% 이상 활성화 & 고점 대비 -4%p 하락 시 전량 청산) ──
+    if peak >= TRAIL_ACTIVATE_PCT and gain_pct <= (peak - TRAIL_GAP_PCT):
+        if sym in sim_positions:
+            sim_close(sym, current_price, f"트레일링청산(고점{peak:+.1f}%)", qty=None)
+        print(f"[🟢 트레일링청산] {sym} | 고점 {peak:+.2f}% → 현재 {gain_pct:+.2f}% "
+              f"| ${entry_price:.2f} → ${current_price:.2f}")
+        return
+
+    # ── +7% 1차 매도 (절반 확보). 나머지는 트레일링이 관리 ──
+    if gain_pct >= SELL_PARTIAL_PCT:
+        if cooldown_ok("alert1"):
+            entry["alert1"] = now_utc
+            pos = sim_positions.get(sym)
+            if pos and not pos.get("partial_done"):
+                half = max(1, pos["qty"] // 2)
+                sim_close(sym, current_price, "+7% 1차(절반)", qty=half)
+            print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
+        return
+
+    # ── [v31] 횡보 청산 완화: 트레일링 미활성(고점<활성임계) & 10분 경과 & +3~+6% 구간만 ──
+    elapsed_min = (now_utc - entry["time"]).total_seconds() / 60
+    if (peak < TRAIL_ACTIVATE_PCT
+            and elapsed_min >= SIDEWAYS_MINUTES
+            and not entry.get("sideways_done")):
+        if SIDEWAYS_MIN_PCT <= gain_pct < SIDEWAYS_MAX_PCT:
+            entry["sideways_done"] = True
+            if sym in sim_positions:
+                sim_close(sym, current_price, "횡보청산", qty=None)
+            print(f"[➡️ 횡보청산] {sym} | ${entry_price:.2f} → ${current_price:.2f} "
+                  f"({gain_pct:+.2f}%) | {elapsed_min:.0f}분 경과")
+            return
+
+
+# ──────────────────────────────────────────
+# [v32.1] 보유 종목 감시 스레드
+# ──────────────────────────────────────────
+
+def position_monitor_loop():
+    """
+    [v32] 보유 종목만 POSITION_CHECK_INTERVAL(3초)마다 감시하는 독립 스레드.
+
+    왜 필요한가:
+      기존 v31은 손절 체크가 run_scan() 맨 앞에서 1회만 돌았고, 그 뒤로
+      스크리너 1콜 + 스냅샷 2콜 + get_bars 최대 60콜(ATR용 30 + analyze용 30 중복)
+      + time.sleep(0.5)×N 이 순차 실행됐음. 여기에 sleep(30)이 더해져
+      실효 감시 간격이 45~90초. -8% 손절이 -18%, -21%에 체결된 원인.
+
+    이 스레드는 보유 종목만 스냅샷 1콜로 조회하므로 3초 주기가 가능.
+    신규 스캔이 아무리 느려도 손절 반응 속도에 영향을 주지 않음.
+    """
+    while True:
+        try:
+            if is_regular_session():
+                with state_lock:
+                    syms = list(sim_positions.keys())
+
+                if syms:
+                    # 네트워크 요청은 락 밖에서 (스캔 스레드를 불필요하게 막지 않도록)
+                    snaps = get_snapshots(syms)
+
+                    with state_lock:
+                        for sym in syms:
+                            # 락 대기 중 다른 스레드가 청산했을 수 있으므로 재확인
+                            if sym not in sim_positions:
+                                continue
+                            snap = snaps.get(sym)
+                            if not snap:
+                                continue
+                            price, src = get_live_price(snap)
+                            if price:
+                                check_sell_timing(sym, float(price), src)
+        except Exception as e:
+            # 감시 스레드는 절대 죽으면 안 됨 — 어떤 예외든 삼키고 계속 돈다
+            print(f"[감시 스레드 예외] {e}")
+
+        time.sleep(POSITION_CHECK_INTERVAL)
+
+
+# ──────────────────────────────────────────
+# 종목 분석
+# ──────────────────────────────────────────
+
+def analyze_regular(sym: str, snap: dict, bars: list = None):
+    # [v32] bars를 인자로 받아 재사용. ATR 재정렬 단계에서 이미 조회한 걸
+    # 여기서 또 부르던 중복 API 콜(스캔당 최대 30콜) 제거.
+    if bars is None:
+        bars = get_bars(sym)
+    if not bars or len(bars) < 6:
+        print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
+        return None
+
+    latest_price, _ = get_live_price(snap)
+    current_price   = latest_price or float(bars[-1]["c"])
+
+    # [v25] 저가주 필터: $1 미만 제외
+    if current_price < MIN_PRICE:
+        print(f"  └ 저가주 제외: ${current_price:.2f} < ${MIN_PRICE}")
+        return None
+
+    price_1m_ago    = float(bars[-2]["c"])
+    if price_1m_ago <= 0:
+        return None
+
+    price_change_1m    = ((current_price - price_1m_ago) / price_1m_ago) * 100
+    rsi                = calc_rsi(bars)   # None일 수 있음 (봉 부족), 참고용 표시만
+
+    # 거래량/OBV/ATR (모두 참고용)
+    vol_ratio, vol_ok  = calc_volume_surge(bars)
+    obv_label          = calc_obv(bars)
+    atr                = calc_atr(bars)
+
+    rsi_disp     = f"{rsi:.1f}" if rsi is not None else "N/A"
+    price_ok_str = "✅" if price_change_1m >= PRICE_CHANGE_1M else "❌"
+    vol_ok_str   = "✅" if vol_ok else "❌"
+    print(
+        f"  └ RSI:{rsi_disp} | 1분:{price_change_1m:+.2f}%{price_ok_str} "
+        f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
+    )
+
+    # 진입 조건: 1분 상승만
+    if price_change_1m < PRICE_CHANGE_1M:
+        return None
+
+    return {
+        "rsi":             rsi if rsi is not None else 0.0,
+        "price_change_1m": price_change_1m,
+        "obv_label":       obv_label,
+        "vol_ratio":       vol_ratio,
+        "atr":             atr,
+    }
+
+
+# ──────────────────────────────────────────
+# 정기 리포트 (매시 정각 / 장마감)
+# ──────────────────────────────────────────
+
+def check_scheduled_reports():
+    global last_hourly_report_et, market_close_sent
+
+    now_et  = get_et_now()
+    et_hour = now_et.hour
+    et_min  = now_et.minute
+    weekday = now_et.weekday()
+
+    if weekday >= 5:
+        return
+
+    # ── 장 종료 최종 일지 (16:00~16:02 ET, 1회) ──
+    if et_hour == 16 and et_min <= 2 and not market_close_sent:
+        market_close_sent = True
+
+        # [v25] 보유 종목 전량 현재가로 강제 청산
+        with state_lock:
+            if sim_positions:
+                held = list(sim_positions.keys())
+                snaps = get_snapshots(held)
+                for sym in held:
+                    snap = snaps.get(sym, {})
+                    price, _ = get_live_price(snap)
+                    if price:
+                        sim_close(sym, float(price), "장마감 강제청산", qty=None)
+                        print(f"  [장마감 강제청산] {sym} @ ${float(price):.2f}")
+
+        print("[📊 장마감 최종 매매일지 전송]")
+        send_telegram(build_trade_report("🔔 장 종료 최종 매매일지"))
+        return
+
+    # 장중(09:30~16:00)에만 정각 리포트
+    if not ((9 * 60 + 30) <= (et_hour * 60 + et_min) <= 16 * 60):
+        return
+
+    # ── 매시 정각 중간 일지 (XX:00~XX:02, 1회/시) ──
+    if et_min <= 2 and et_hour != last_hourly_report_et and et_hour >= 10:
+        last_hourly_report_et = et_hour
+        now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+        title   = f"🕐 {et_hour}:00 ET ({now_kst.strftime('%H:%M')} KST) 중간 매매일지"
+        print(f"[📊 정각 매매일지 전송] {et_hour}:00 ET")
+        send_telegram(build_trade_report(title))
+
+
+# ──────────────────────────────────────────
+# 메인 스캔
+# ──────────────────────────────────────────
+
+def run_scan():
+    # [v32] 보유 종목 손절/트레일링 체크 로직은 position_monitor_loop()로 이전.
+    # 이 함수는 이제 신규 진입 탐색만 담당한다.
+    symbols = get_active_symbols()
+    if not symbols:
+        return
+    snapshots = get_snapshots(symbols)
+    if not snapshots:
+        return
+    ranked = build_ranked(snapshots)
+    if not ranked:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+
+    top = ranked[:REGULAR_TOP_N]
+    print(f"[정규장] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
+    with state_lock:
+        print(f"  {holdings_block().replace(chr(10), ' | ')}")
+    if blacklisted_today:
+        print(f"  🚫 블랙리스트: {', '.join(sorted(blacklisted_today))}")
+
+    # [v31] 일일 리스크 게이트 확인 — 막혀 있으면 신규매수 스킵
+    # (보유분 관리는 감시 스레드가 계속 수행하므로 여기서 return해도 안전)
+    can_buy, lock_reason = buys_allowed()
+    if not can_buy:
+        print(f"  [🔒 신규매수 중단] {lock_reason} (당일 {daily_pnl_pct():+.2f}%) — 보유분 관리만 진행")
+        return
+
+    # ATR 계산 후 높은 순으로 재정렬
+    top_with_atr = []
+    for stock in top:
+        sym = stock["symbol"]
+        if sym in blacklisted_today:
+            continue
+        bars = get_bars(sym)
+        atr  = calc_atr(bars) if bars else 0.0
+        # [v32] bars를 함께 실어 보내 analyze_regular에서 재조회하지 않게 함
+        top_with_atr.append({**stock, "_atr": atr, "_bars": bars})
+
+    top_with_atr.sort(key=lambda x: x["_atr"], reverse=True)
+    print(f"  [ATR 재정렬] " + " | ".join(
+        f"{s['symbol']}({s['_atr']:.3f})" for s in top_with_atr[:5]
+    ))
+
+    # ── [v24] 스캔당 최대 MAX_BUY_PER_SCAN 종목만 신규 매수 ──
+    bought_this_scan = 0
+
+    for stock in top_with_atr:
+        sym = stock["symbol"]
+
+        if sym in last_alert:
+            elapsed = (now_utc - last_alert[sym]).total_seconds() / 60
+            if elapsed < COOLDOWN_MINUTES:
+                continue
+
+        print(f"  [{sym}] 분석 중...")
+        result = analyze_regular(sym, stock["snap"], stock.get("_bars"))
+        if result is None:
+            continue
+
+        # [v32] 매수 제한 체크를 entry_prices 등록보다 먼저.
+        if bought_this_scan >= MAX_BUY_PER_SCAN:
+            print(f"  [매수 제한] {sym} — 이번 스캔 {MAX_BUY_PER_SCAN}종목 초과, 스킵")
+            continue
+
+        # [v32] 유령 진입 제거:
+        # 기존엔 sim_open 성공 여부와 무관하게 entry_prices에 먼저 등록해서,
+        # 실제로 사지 않은 종목(슬롯 풀/예수금 부족/블랙리스트)이 감시 대상에 남았음.
+        # 이제 매수에 성공한 종목만 등록한다.
+        with state_lock:
+            bought = sim_open(sym, stock["price"])
+            if not bought:
+                continue
+
+            bought_this_scan  += 1
+            last_alert[sym]    = now_utc
+            entry_prices[sym]  = {
+                "entry": stock["price"], "time": datetime.now(timezone.utc),
+                "alert1": None, "stop": None,
+                "sideways_done": False, "peak": 0.0,   # [v31] peak 추적
+            }
+
+        print(
+            f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
+            f"| 거래량 {result['vol_ratio']:.1f}x | ATR {result['atr']:.3f} | 진입가 ${stock['price']:.2f}"
+        )
+        time.sleep(0.5)
+
+
+# ──────────────────────────────────────────
+# 진입점
+# ──────────────────────────────────────────
+
+def main():
+    global market_close_sent, daily_start_pnl, daily_start_cash
+
+    print("=" * 60)
+    print(f"🚀 {BOT_TITLE} | {BOT_FILENAME} | {BOT_VERSION} 시작!")
+    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
+    print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차(절반) | 트레일링(고점 +{TRAIL_ACTIVATE_PCT}% 활성, -{TRAIL_GAP_PCT}%p 갭) | {STOP_LOSS_PCT}% 손절")
+    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% (트레일링 미활성 종목만)")
+    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
+    print(f"👁 [v32.1] 보유 감시 {POSITION_CHECK_INTERVAL}초 (독립 스레드) | 신규 스캔 {SCAN_INTERVAL}초")
+    print(f"🔒 일일 게이트: +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도 (신규매수 중단)")
+    print(f"🔔 장마감 보유 종목 전량 강제 청산")
+    print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
+    print("=" * 60)
+
+    restored, restore_source = load_state()
+    if restored:
+        send_telegram(restored_state_message(restore_source))
+
+    atexit.register(lambda: save_state(force=True))
+
+    send_telegram(
+        f"✅ <b>시뮬레이션 봇 시작!</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
+        f"🎯 +{SELL_PARTIAL_PCT}% 1차(절반) → 트레일링(고점 +{TRAIL_ACTIVATE_PCT}%, -{TRAIL_GAP_PCT}%p) | {STOP_LOSS_PCT}% 손절\n"
+        f"📦 동시 보유 최대 {MAX_POSITIONS}종목\n"
+        f"👁 <b>[v32.1] 보유 감시 {POSITION_CHECK_INTERVAL}초 (스레드 분리)</b> | 스캔 {SCAN_INTERVAL}초\n"
+        f"🩺 손절 슬리피지 추적 기능 추가\n"
+        f"💾 <b>[v32.1] 상태 자동 저장·복원</b> ({STATE_SAVE_INTERVAL}초 주기)\n"
+        f"🔒 당일 +{DAILY_PROFIT_LOCK_PCT}% 수익잠금 / {DAILY_LOSS_LIMIT_PCT}% 손실한도\n"
+        f"🔔 장마감 보유 종목 전량 강제 청산\n"
+        f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
+    )
+
+    # [v32.1] 보유 종목 감시 스레드 기동. daemon=True라 메인이 죽으면 같이 종료됨.
+    monitor = threading.Thread(target=position_monitor_loop, daemon=True, name="pos-monitor")
+    monitor.start()
+    print(f"👁 [v32.1] 보유 종목 감시 스레드 시작 ({POSITION_CHECK_INTERVAL}초 주기)")
+
+    while True:
+        now_str = datetime.now().strftime('%H:%M:%S')
+        now_et  = get_et_now()
+
+        # 날짜 바뀌면 당일 플래그 리셋
+        if now_et.hour == 9 and now_et.minute < 30:
+            if market_close_sent:
+                market_close_sent = False
+                # [v31] 일일 리스크 게이트 기준 갱신 (장 시작 = 전량 청산 후라 예수금 = 자본)
+                daily_start_pnl  = sim_stats["total_pnl"]
+                daily_start_cash = sim_stats["cash"]
+                print(f"[리셋] 장마감 플래그 초기화 | 일일게이트 기준 갱신 "
+                      f"(기준자본 ${daily_start_cash:.2f})")
+                slippage_log.clear()   # [v32] 슬리피지 로그도 일단위 리셋
+            if blacklisted_today or stop_loss_count:
+                blacklisted_today.clear()
+                stop_loss_count.clear()
+                print("[리셋] 블랙리스트 및 손절 카운트 초기화 (새 장 시작)")
+                save_state(force=True)
+
+        check_scheduled_reports()
+
+        if not is_regular_session():
+            print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
+        else:
+            scan_start = time.time()
+            print(f"\n[{now_str}] 정규장 스캔 시작")
+            run_scan()
+            # [v32] 스캔 소요시간 로깅 — 중복 get_bars 제거 효과 확인용.
+            # 감시가 스레드로 분리됐으므로 이 값이 커져도 손절 반응 속도와는 무관.
+            print(f"  [스캔 소요] {time.time() - scan_start:.1f}초")
+
+        save_state()
+        time.sleep(SCAN_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
