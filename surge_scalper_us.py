@@ -113,6 +113,7 @@ TIER_C_TRAIL_PCT         = 15.0    # 고점 대비 이만큼 빠지면 트레일
 TIER_C_MARKET_BUFFER_PCT = 5.0     # 시장가 대용: 매수 +5%/매도 -5% 공격적 지정가
 EXIT_SELL_BUFFER_PCT     = 3.0     # 초입/티어A/B 전량매도(손절·트레일링 등)도 공격적 지정가로 즉시체결 (체결지연 슬리피지 방지)
 EXIT_MAX_RETRIES         = 5       # 손절/익절 청산 주문의 유한 재시도 상한
+EXIT_RATE_LIMIT_MAX_RETRIES = 10   # 주문 시도에서 제외할 연속 KIS rate limit 상한
 EXIT_RETRY_INTERVAL      = 2.0     # KIS 1초 throttle보다 긴 안전 간격
 EXIT_MAX_REPRICE_PCT     = 10.0    # 최초 기준가 대비 매도 지정가 하한
 # TIER_C는 시간청산 없음 — 트레일링 하나로만 청산
@@ -976,20 +977,27 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
         previous_price = None
         outstanding = _EXIT_OPEN_ORDERS.get(symbol)
         last_error = ""
-        attempts_done = 0
+        actual_attempts = 0
+        rate_limit_retries = 0
+        balance_retries = 0
 
-        for attempt in range(1, EXIT_MAX_RETRIES + 1):
+        while actual_attempts < EXIT_MAX_RETRIES:
             holding = kis.get_overseas_holding(symbol, exchange)
             if not holding.get("ok", True):
                 last_error = "balance_lookup_failed"
+                balance_retries += 1
+                if balance_retries >= EXIT_MAX_RETRIES:
+                    break
                 time.sleep(_retry_wait_seconds())
                 continue
+            balance_retries = 0
             sellable = int(holding.get("sellable_qty", holding.get("qty", 0)) or 0)
             sold_qty = max(initial_qty - sellable, 0)
             if sellable <= 0 or sold_qty >= target_qty:
                 _EXIT_OPEN_ORDERS.pop(symbol, None)
                 return {"success": True, "sold_qty": min(sold_qty, target_qty),
-                        "remaining_qty": sellable, "attempts": attempt - 1,
+                        "remaining_qty": sellable, "attempts": actual_attempts,
+                        "rate_limit_retries": rate_limit_retries,
                         "last_price": previous_price or 0.0, "error": ""}
 
             if outstanding:
@@ -1013,11 +1021,25 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
                 last_error = f"quote_{price_result.get('status', 'failed')}"
                 break
             remaining_target = min(target_qty - sold_qty, sellable)
-            attempts_done = attempt
             order = kis.place_order(symbol, remaining_target, price, "sell",
                                     session="regular", exchange=exchange)
+            if order.get("rt_cd") != "0" and _is_kis_rate_limit(order):
+                rate_limit_retries += 1
+                last_error = str(order.get("msg1", "rate_limit"))
+                log.warning("KIS rate limit %s: rate_limit=%d/%d actual_attempts=%d/%d",
+                            symbol, rate_limit_retries, EXIT_RATE_LIMIT_MAX_RETRIES,
+                            actual_attempts, EXIT_MAX_RETRIES)
+                if rate_limit_retries > EXIT_RATE_LIMIT_MAX_RETRIES:
+                    last_error = "rate_limit_retries_exhausted"
+                    break
+                time.sleep(_retry_wait_seconds(order))
+                continue
+            actual_attempts += 1
             if order.get("rt_cd") != "0":
                 last_error = str(order.get("msg1", "order_failed"))
+                log.warning("청산 주문 실패 %s: actual_attempts=%d/%d rate_limit=%d/%d 오류=%s",
+                            symbol, actual_attempts, EXIT_MAX_RETRIES,
+                            rate_limit_retries, EXIT_RATE_LIMIT_MAX_RETRIES, last_error)
                 time.sleep(_retry_wait_seconds(order))
                 continue
             order_no = str((order.get("output") or {}).get("ODNO") or
@@ -1038,7 +1060,8 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
             remaining = max(initial_qty - sold_qty, 0)
         return {"success": remaining <= 0 or sold_qty >= target_qty,
                 "sold_qty": min(sold_qty, target_qty), "remaining_qty": remaining,
-                "attempts": attempts_done, "last_price": previous_price or 0.0,
+                "attempts": actual_attempts, "rate_limit_retries": rate_limit_retries,
+                "last_price": previous_price or 0.0,
                 "error": last_error or "max_retries_exhausted"}
     finally:
         _EXIT_IN_PROGRESS.discard(symbol)
@@ -1054,7 +1077,9 @@ def _notify_exit_failure(symbol: str, result: dict):
     notify(
         f"🚨 긴급: {symbol} 청산 미완료\n"
         f"남은수량={result.get('remaining_qty')}주 | 마지막가격=${result.get('last_price', 0):.4f}\n"
-        f"시도={result.get('attempts')}/{EXIT_MAX_RETRIES} | 오류={result.get('error')}\n"
+        f"실제시도={result.get('attempts')}/{EXIT_MAX_RETRIES} | "
+        f"rate limit={result.get('rate_limit_retries', 0)}/{EXIT_RATE_LIMIT_MAX_RETRIES} | "
+        f"오류={result.get('error')}\n"
         "장부를 유지하고 다음 감시 루프에서 재평가합니다."
     )
 
@@ -1537,8 +1562,9 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         if remaining > 0:
             p["qty"] = remaining
             save_positions(positions)
-        log.warning("청산 미완료 %s[%s]: 체결=%d 잔여=%d 시도=%d 오류=%s",
-                    sym, tier, sold_qty, remaining, result.get("attempts"), result.get("error"))
+        log.warning("청산 미완료 %s[%s]: 체결=%d 잔여=%d 실제시도=%d rate_limit=%d 오류=%s",
+                    sym, tier, sold_qty, remaining, result.get("attempts"),
+                    result.get("rate_limit_retries", 0), result.get("error"))
         _notify_exit_failure(sym, result)
 
 
