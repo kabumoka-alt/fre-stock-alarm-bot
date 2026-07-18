@@ -217,15 +217,15 @@ class TradeLogger:
             self.log.warning("진입 주문 분석 기록 실패(매매 계속): %s",exc)
 
     def mark_exit_signal(self, trade_id, symbol, reason, reference_price, qty,
-                         remaining_qty=None, payload=None):
+                         remaining_qty=None, payload=None, signal_time=None):
         try:
-            now=_utc_now()
+            now=signal_time or _utc_now()
             with self._connect() as conn:
                 conn.execute("UPDATE trades SET exit_signal_time_et=?,exit_reason=?,updated_at_utc=? WHERE trade_id=?",
-                             (_iso_et(now),reason,_iso_utc(now),trade_id))
+                             (_iso_et(now),reason,_iso_utc(),trade_id))
             self.log_event(trade_id,"EXIT_SIGNAL",symbol=symbol,reason=reason,
                            requested_price=reference_price,requested_qty=qty,
-                           remaining_qty=remaining_qty,payload=payload)
+                           remaining_qty=remaining_qty,payload=payload,event_time=now)
             self._after_write()
         except Exception as exc:
             self.log.warning("청산 신호 분석 기록 실패(매매 계속): %s",exc)
@@ -289,7 +289,7 @@ class TradeLogger:
         except Exception as exc:
             self.log.warning("극값 추적 초기화 실패(매매 계속): %s", exc)
 
-    def update_extremes(self, trade_id, price, now=None, force=False):
+    def update_extremes_in_memory(self, trade_id, price, now=None):
         try:
             now = now or _utc_now()
             if now.tzinfo is None: now = now.replace(tzinfo=timezone.utc)
@@ -301,6 +301,15 @@ class TradeLogger:
                     if price > state["high"]: state["high"] = float(price); state["mfe_time"] = now; changed = True
                     if price < state["low"]: state["low"] = float(price); state["mae_time"] = now; changed = True
                 state["dirty"] = state["dirty"] or changed
+                return changed
+        except Exception as exc:
+            self.log.warning("MFE/MAE 메모리 갱신 실패(매매 계속): %s", exc); return False
+
+    def flush_extremes_if_due(self, trade_id, force=False):
+        try:
+            with self._lock:
+                state = self._extremes.get(trade_id)
+                if not state: return False
                 if not state["dirty"] and not force: return False
                 elapsed = time.monotonic() - state["last_flush"]
                 high_delta = abs(state["high"]-state["flushed_high"])/state["entry"]*100
@@ -323,10 +332,16 @@ class TradeLogger:
         except Exception as exc:
             self.log.warning("MFE/MAE 기록 실패(매매 계속): %s", exc); return False
 
+    def update_extremes(self, trade_id, price, now=None, force=False):
+        """Compatibility wrapper for non-latency-sensitive callers."""
+        self.update_extremes_in_memory(trade_id, price, now=now)
+        return self.flush_extremes_if_due(trade_id, force=force)
+
     def log_event(self, trade_id, event_type, symbol=None, reason=None, attempt_no=None,
                   rate_limit_count=None, requested_price=None, requested_qty=None,
                   remaining_qty=None, quote_source=None, bid=None, ask=None,
-                  quote_age_sec=None, message=None, payload=None, min_interval_sec=0):
+                  quote_age_sec=None, message=None, payload=None, min_interval_sec=0,
+                  event_time=None):
         try:
             key=(trade_id,event_type)
             if min_interval_sec:
@@ -334,7 +349,8 @@ class TradeLogger:
                     last=self._event_last.get(key); now_mono=time.monotonic()
                     if last is not None and now_mono-last < min_interval_sec: return False
                     self._event_last[key]=now_mono
-            now=_utc_now(); payload_json=json.dumps(_clean_payload(payload or {}),ensure_ascii=False)[:4000]
+            now=event_time or _utc_now()
+            payload_json=json.dumps(_clean_payload(payload or {}),ensure_ascii=False)[:4000]
             with self._connect() as conn:
                 conn.execute("""INSERT INTO trade_events
                     (trade_id,event_time_utc,event_time_et,event_type,symbol,reason,attempt_no,

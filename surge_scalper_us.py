@@ -1529,14 +1529,11 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         trade_id = p.get("trade_id")
         trade_logger.track_position(trade_id, p.get("entry_price"), p.get("entry_time"),
                                     p.get("peak_price"), p.get("lowest_price"))
-        trade_logger.update_extremes(trade_id, cur)
+        trade_logger.update_extremes_in_memory(trade_id, cur)
 
         # stale 가격만 남아도 보유분 감시는 멈추지 않는다. get_resilient_price가 사용 가능한
         # 세 소스 중 timestamp가 가장 최신인 값을 골랐으며, 상태/소스 경고는 중복 제한된다.
         stale = age is not None and age > PRICE_STALE_SEC
-        if stale:
-            trade_logger.record_stale_quote(
-                trade_id, sym, age, min_interval_sec=PRICE_WARNING_INTERVAL)
 
         # 초입/티어A/티어C는 고점을 계속 추적 (트레일링 스톱의 기준)
         if tier in ("early", "A", "C"):
@@ -1592,18 +1589,27 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
                 reason = f"시간청산 {held:.0f}분 ({pnl:+.1f}%)"
 
         if not reason:
+            if stale:
+                trade_logger.record_stale_quote(
+                    trade_id, sym, age, min_interval_sec=PRICE_WARNING_INTERVAL)
+            trade_logger.flush_extremes_if_due(trade_id)
             continue
 
         intended_qty = max(1, p["qty"] // 2) if exit_mode == "half" else p["qty"]
         emoji = "🔴" if pnl < 0 else "💰"
         tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
         exit_reason = analytics_exit_reason(reason)
-        trade_logger.mark_exit_signal(
-            trade_id, sym, exit_reason, cur, intended_qty,
-            remaining_qty=p.get("qty"), payload={"display_reason": reason})
+        exit_signal_time = datetime.now(timezone.utc)
         result = execute_exit_with_retries(
             sym, intended_qty, p.get("exchange", "NASD"), cur, exit_mode == "full",
             trade_id=trade_id)
+        trade_logger.mark_exit_signal(
+            trade_id, sym, exit_reason, cur, intended_qty,
+            remaining_qty=p.get("qty"), payload={"display_reason": reason},
+            signal_time=exit_signal_time)
+        if stale:
+            trade_logger.record_stale_quote(
+                trade_id, sym, age, min_interval_sec=PRICE_WARNING_INTERVAL)
         sold_qty = int(result.get("sold_qty", 0) or 0)
         remaining = int(result.get("remaining_qty", p["qty"]) or 0)
         if sold_qty > 0:
@@ -1641,6 +1647,7 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         if remaining > 0:
             p["qty"] = remaining
             save_positions(positions)
+        trade_logger.flush_extremes_if_due(trade_id, force=True)
         log.warning("청산 미완료 %s[%s]: 체결=%d 잔여=%d 실제시도=%d rate_limit=%d 오류=%s",
                     sym, tier, sold_qty, remaining, result.get("attempts"),
                     result.get("rate_limit_retries", 0), result.get("error"))
