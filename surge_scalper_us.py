@@ -38,6 +38,7 @@ import json
 import time
 import logging
 import math
+import atexit
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -45,6 +46,7 @@ import requests
 
 # KIS 해외주식 체결은 기존 공용 모듈 그대로 재활용
 import kis_client as kis
+from trade_logger import TradeLogger
 
 # ─────────────────────────────────────────────
 # 전략 파라미터 (매매내역 분석 기반 — 내일 돌려보고 여기부터 튜닝)
@@ -138,6 +140,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 STATE_FILE = os.path.expanduser("~/surge_scalper_us_positions.json")
 PENDING_BUYS_FILE = os.path.expanduser("~/surge_scalper_us_pending_buys.json")
 DAILY_STATE_FILE = os.path.expanduser("~/surge_scalper_us_daily_state.json")
+TRADE_ANALYTICS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "data", "trade_analytics.db")
 BLACKLIST  = {}   # {key: 블랙리스트 등록시각} — 매도 후 REENTRY_COOLDOWN_MIN 지나면 자동 해제
 REENTRY_COOLDOWN_MIN = 60   # 같은 종목(같은 티어) 재진입 금지 시간(분)
 PENDING_BUYS: dict = {}
@@ -228,6 +232,27 @@ logging.basicConfig(
     handlers=[logging.FileHandler("surge_scalper_us.log"), logging.StreamHandler()],
 )
 log = logging.getLogger("surge_us")
+trade_logger = TradeLogger(TRADE_ANALYTICS_DB, bot_name="surge_scalper_us",
+                           bot_version=VERSION, logger=log)
+atexit.register(trade_logger.close)
+
+
+def analytics_exit_reason(reason: str) -> str:
+    """기존 사용자용 청산 문구를 분석용 안정 enum으로만 매핑한다."""
+    text = reason or ""
+    if "트레일링" in text:
+        return "TRAILING_STOP"
+    if "1차익절" in text or text.startswith("익절"):
+        return "TAKE_PROFIT_1"
+    if "손절" in text:
+        return "STOP_LOSS"
+    if "시간청산" in text:
+        return "SIDEWAYS_EXIT"
+    if "장마감" in text:
+        return "DAILY_RISK_EXIT"
+    if "STALE" in text.upper():
+        return "EMERGENCY_STALE"
+    return "UNKNOWN"
 
 
 def notify(msg: str):
@@ -956,7 +981,8 @@ def _order_is_open(order_no: str, symbol: str, exchange: str) -> tuple[bool, boo
 
 
 def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
-                              observed_price: float, full_exit: bool) -> dict:
+                              observed_price: float, full_exit: bool,
+                              trade_id: str = None) -> dict:
     """실잔고 우선·취소 확인 후 재주문하는 bounded marketable-limit 청산."""
     if symbol in _EXIT_IN_PROGRESS:
         return {"success": False, "sold_qty": 0, "remaining_qty": book_qty,
@@ -1026,6 +1052,11 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
             if order.get("rt_cd") != "0" and _is_kis_rate_limit(order):
                 rate_limit_retries += 1
                 last_error = str(order.get("msg1", "rate_limit"))
+                trade_logger.log_event(
+                    trade_id, "EXIT_RATE_LIMITED", symbol=symbol,
+                    attempt_no=actual_attempts, rate_limit_count=rate_limit_retries,
+                    requested_price=price, requested_qty=remaining_target,
+                    remaining_qty=sellable, message=last_error)
                 log.warning("KIS rate limit %s: rate_limit=%d/%d actual_attempts=%d/%d",
                             symbol, rate_limit_retries, EXIT_RATE_LIMIT_MAX_RETRIES,
                             actual_attempts, EXIT_MAX_RETRIES)
@@ -1037,6 +1068,11 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
             actual_attempts += 1
             if order.get("rt_cd") != "0":
                 last_error = str(order.get("msg1", "order_failed"))
+                trade_logger.log_event(
+                    trade_id, "EXIT_ORDER_REJECTED", symbol=symbol,
+                    attempt_no=actual_attempts, rate_limit_count=rate_limit_retries,
+                    requested_price=price, requested_qty=remaining_target,
+                    remaining_qty=sellable, message=last_error)
                 log.warning("청산 주문 실패 %s: actual_attempts=%d/%d rate_limit=%d/%d 오류=%s",
                             symbol, actual_attempts, EXIT_MAX_RETRIES,
                             rate_limit_retries, EXIT_RATE_LIMIT_MAX_RETRIES, last_error)
@@ -1050,6 +1086,9 @@ def execute_exit_with_retries(symbol: str, book_qty: int, exchange: str,
             previous_price = price
             outstanding = {"order_no": order_no, "qty": remaining_target}
             _EXIT_OPEN_ORDERS[symbol] = outstanding
+            trade_logger.mark_exit_order(
+                trade_id, symbol, price, remaining_target, actual_attempts,
+                rate_limit_retries, remaining_qty=sellable)
             time.sleep(_retry_wait_seconds(order))
 
         final = kis.get_overseas_holding(symbol, exchange)
@@ -1150,6 +1189,7 @@ def _apply_pending_fill(positions: dict, pending_id: str, filled_qty: int, fille
         pos["qty"] = filled_qty
         pos["entry_price"] = entry_price
         pos["peak_price"] = max(pos.get("peak_price", entry_price), entry_price)
+        pos.setdefault("trade_id", pending.get("trade_id"))
     else:
         positions[key] = {
             "symbol": pending["symbol"],
@@ -1159,11 +1199,14 @@ def _apply_pending_fill(positions: dict, pending_id: str, filled_qty: int, fille
             "exchange": pending["exchange"],
             "mode": pending["tier"],
             "entry_time": pending["entry_time"],
+            "trade_id": pending.get("trade_id"),
         }
     pending["recorded_qty"] = filled_qty
     pending["recorded_cost"] = filled_cost
     save_positions(positions)
     save_pending_buys()
+    trade_logger.confirm_entry(pending.get("trade_id"), pending["symbol"], entry_price,
+                               filled_qty, pending.get("order_price"))
     return filled_qty - recorded_qty
 
 
@@ -1233,7 +1276,8 @@ def reconcile_pending_buys(positions: dict):
             save_pending_buys()
 
 
-def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pct=None):
+def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pct=None,
+             entry_rank=None):
     """주문 접수 후 실제 체결분만 장부에 반영. 반환값은 실제 체결금액."""
     if PENDING_BUYS:
         log.warning("미확정 매수주문 %d건 존재 — 신규주문 차단", len(PENDING_BUYS))
@@ -1249,19 +1293,28 @@ def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pc
         log.info("예산 부족 스킵: %s[%s] budget=%.1f price=%.2f", sym, tier, budget, price)
         return 0.0
 
+    trade_id = trade_logger.create_trade(
+        sym, exch, tag, requested_price=price, requested_qty=qty,
+        entry_rank=entry_rank, quote=price_result,
+        metrics={"day_change_pct": change_pct})
+
     before = kis.get_overseas_holding(sym, exch)
     if not before.get("ok", True):
         log.warning("매수 전 기준잔고 조회 실패 %s[%s] — 주문 중단", sym, tier)
+        trade_logger.mark_entry_failed(trade_id, sym, "balance_lookup_failed")
         return 0.0
     res = order_fn(sym, qty, price, exch)
     if res.get("rt_cd") != "0":
         log.warning("주문실패 %s[%s] rt_cd=%s msg=%s", sym, tier, res.get("rt_cd"), res.get("msg1"))
+        trade_logger.mark_entry_failed(trade_id, sym, "order_rejected")
         return 0.0
 
     output = res.get("output") or {}
     order_no = str(output.get("ODNO") or output.get("odno") or "")
     pending_id = order_no or f"{sym}-{tier}-{time.time_ns()}"
     key = f"{sym}#{tier}" if tier != "early" else sym
+    submitted_price = float(res.get("_submitted_price", price) or price)
+    trade_logger.mark_entry_order(trade_id, sym, submitted_price, qty)
     PENDING_BUYS[pending_id] = {
         "order_no": order_no,
         "symbol": sym,
@@ -1270,7 +1323,8 @@ def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pc
         "tag": tag,
         "position_key": key,
         "requested_qty": qty,
-        "order_price": float(res.get("_submitted_price", price) or price),
+        "order_price": submitted_price,
+        "trade_id": trade_id,
         "before_qty": int(before.get("qty", 0) or 0),
         "before_purchase_amount": float(before.get("purchase_amount", 0) or 0),
         "recorded_qty": 0,
@@ -1296,6 +1350,7 @@ def _try_buy(positions, sym, price, exch, tier, tag, budget, order_fn, change_pc
             del PENDING_BUYS[pending_id]
             save_pending_buys()
             log.warning("매수 미체결 취소완료 %s[%s] 요청=%d주 — 장부 미생성", sym, tier, qty)
+            trade_logger.mark_entry_failed(trade_id, sym, "unfilled_cancelled")
         else:
             log.warning("매수 체결대기 %s[%s] 요청=%d주 — 장부 미생성, 후속주문 차단", sym, tier, qty)
         return 0.0
@@ -1330,6 +1385,7 @@ def screen_and_enter(positions: dict):
 
     early = [m for m in cands if classify(m) == "early"]
     chase = [m for m in cands if classify(m) == "chase"] if CHASE_ENABLED else []
+    candidate_rank = {m.get("symbol"): rank for rank, m in enumerate(cands, 1)}
     scan_total_budget = _scan_buyable_amount(cands)
     if scan_total_budget <= 0:
         log.warning("스캔 총예산 0 — 신규매수 중단")
@@ -1362,7 +1418,7 @@ def screen_and_enter(positions: dict):
         filled_cost = _try_buy(
             positions, sym, price, exch, "early", "초입", budget,
             lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
-            change_pct=m.get("change_pct"))
+            change_pct=m.get("change_pct"), entry_rank=candidate_rank.get(sym))
         if filled_cost > 0:
             remaining_budget = max(remaining_budget - filled_cost, 0.0)
             early_open += 1
@@ -1390,7 +1446,7 @@ def screen_and_enter(positions: dict):
         filled_cost = _try_buy(
             positions, sym, price, exch, "A", "추격A", budget,
             lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
-            change_pct=m.get("change_pct"))
+            change_pct=m.get("change_pct"), entry_rank=candidate_rank.get(sym))
         if filled_cost > 0:
             remaining_budget = max(remaining_budget - filled_cost, 0.0)
             a_open += 1
@@ -1417,7 +1473,7 @@ def screen_and_enter(positions: dict):
         filled_cost = _try_buy(
             positions, sym, price, exch, "B", "추격B", budget,
             lambda s, q, p, e: kis.place_order(s, q, p, "buy", session="regular", exchange=e),
-            change_pct=m.get("change_pct"))
+            change_pct=m.get("change_pct"), entry_rank=candidate_rank.get(sym))
         if filled_cost > 0:
             remaining_budget = max(remaining_budget - filled_cost, 0.0)
             b_open += 1
@@ -1439,7 +1495,7 @@ def screen_and_enter(positions: dict):
                         positions, sym, price, exch, "C", "추격C(1위)", budget,
                         lambda s, q, p, e: place_aggressive(
                             s, q, p, "buy", e, TIER_C_MARKET_BUFFER_PCT),
-                        change_pct=top.get("change_pct"))
+                        change_pct=top.get("change_pct"), entry_rank=1)
                     if filled_cost > 0:
                         remaining_budget = max(remaining_budget - filled_cost, 0.0)
                         n_buy += 1
@@ -1470,9 +1526,17 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             log.warning("감시 %s[%s]: 가격조회 실패(0) — 판단 불가", sym, tier)
             continue
 
+        trade_id = p.get("trade_id")
+        trade_logger.track_position(trade_id, p.get("entry_price"), p.get("entry_time"),
+                                    p.get("peak_price"), p.get("lowest_price"))
+        trade_logger.update_extremes(trade_id, cur)
+
         # stale 가격만 남아도 보유분 감시는 멈추지 않는다. get_resilient_price가 사용 가능한
         # 세 소스 중 timestamp가 가장 최신인 값을 골랐으며, 상태/소스 경고는 중복 제한된다.
         stale = age is not None and age > PRICE_STALE_SEC
+        if stale:
+            trade_logger.record_stale_quote(
+                trade_id, sym, age, min_interval_sec=PRICE_WARNING_INTERVAL)
 
         # 초입/티어A/티어C는 고점을 계속 추적 (트레일링 스톱의 기준)
         if tier in ("early", "A", "C"):
@@ -1533,8 +1597,13 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         intended_qty = max(1, p["qty"] // 2) if exit_mode == "half" else p["qty"]
         emoji = "🔴" if pnl < 0 else "💰"
         tag = {"early": "초입", "A": "추격A", "B": "추격B", "C": "추격C(1위)"}.get(tier, tier)
+        exit_reason = analytics_exit_reason(reason)
+        trade_logger.mark_exit_signal(
+            trade_id, sym, exit_reason, cur, intended_qty,
+            remaining_qty=p.get("qty"), payload={"display_reason": reason})
         result = execute_exit_with_retries(
-            sym, intended_qty, p.get("exchange", "NASD"), cur, exit_mode == "full")
+            sym, intended_qty, p.get("exchange", "NASD"), cur, exit_mode == "full",
+            trade_id=trade_id)
         sold_qty = int(result.get("sold_qty", 0) or 0)
         remaining = int(result.get("remaining_qty", p["qty"]) or 0)
         if sold_qty > 0:
@@ -1545,11 +1614,21 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
             p["qty"] = remaining
             p["partial_done"] = True
             save_positions(positions)
+            trade_logger.finalize_trade(
+                trade_id, sym, exit_reason, result.get("last_price") or cur,
+                sold_qty, remaining, result.get("attempts", 0),
+                result.get("rate_limit_retries", 0), p["entry_price"], False,
+                "submitted_limit_price", kis_fill_verified=False)
             notify(f"{emoji} 매도[{tag}] {sym} {sold_qty}주 {reason} @${cur:.2f} ({pnl:+.1f}%) "
                    f"(잔여 {p['qty']}주 계속 보유·트레일링 관리)")
             continue
 
         if result.get("success") and exit_mode == "full" and remaining <= 0:
+            trade_logger.finalize_trade(
+                trade_id, sym, exit_reason, result.get("last_price") or cur,
+                sold_qty, remaining, result.get("attempts", 0),
+                result.get("rate_limit_retries", 0), p["entry_price"], True,
+                "submitted_limit_price", kis_fill_verified=False)
             if sold_qty > 0:
                 notify(f"{emoji} 매도[{tag}] {sym} {sold_qty}주 @${cur:.2f} — {reason}")
             else:
@@ -1565,6 +1644,13 @@ def monitor_and_exit(positions: dict, force_all: bool = False):
         log.warning("청산 미완료 %s[%s]: 체결=%d 잔여=%d 실제시도=%d rate_limit=%d 오류=%s",
                     sym, tier, sold_qty, remaining, result.get("attempts"),
                     result.get("rate_limit_retries", 0), result.get("error"))
+        trade_logger.log_event(
+            trade_id, "EXIT_FAILED", symbol=sym, reason=exit_reason,
+            attempt_no=result.get("attempts"),
+            rate_limit_count=result.get("rate_limit_retries", 0),
+            requested_price=result.get("last_price") or cur,
+            requested_qty=intended_qty, remaining_qty=remaining,
+            message=result.get("error"))
         _notify_exit_failure(sym, result)
 
 
@@ -1582,6 +1668,26 @@ def main():
 
     positions = load_positions()
     PENDING_BUYS = load_pending_buys()
+    open_analytics = trade_logger.open_trades()
+    open_by_symbol = {row.get("symbol"): row for row in open_analytics}
+    linked = False
+    for key, position in positions.items():
+        sym = position.get("symbol", symbol_of_key(key))
+        row = open_by_symbol.get(sym)
+        if not position.get("trade_id"):
+            position["trade_id"] = (row.get("trade_id") if row else
+                trade_logger.recover_position(
+                    sym, position.get("exchange", "NASD"), position.get("entry_price"),
+                    position.get("qty", 0), position.get("entry_time")))
+            linked = True
+        trade_logger.track_position(
+            position.get("trade_id"), position.get("entry_price"), position.get("entry_time"),
+            (row or {}).get("highest_price") or position.get("peak_price"),
+            (row or {}).get("lowest_price") or position.get("entry_price"))
+    if linked:
+        save_positions(positions)
+    log.info("거래 분석 DB 열린 거래=%d 상태=%s", len(trade_logger.open_trades()),
+             trade_logger.health_summary())
     if positions:
         notify(f"♻️ 기존 포지션 {len(positions)}건 복원: " + ", ".join(positions.keys()))
     if PENDING_BUYS:
